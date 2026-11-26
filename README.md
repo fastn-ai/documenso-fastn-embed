@@ -1,3 +1,10 @@
+> [!NOTE]
+> **This fork embeds [fastn](https://fastn.ai) integrations into Documenso.** Each team connects its own HubSpot, Slack and Documenso server under **Team settings > Integrations**: a deal reaching *Contract Sent* sends a contract, a signed contract moves the deal to *Closed Won*, and Slack is notified at each step.
+>
+> - Step-by-step write-up with screenshots: [Documenso and fastn: contract signing integration (Google Doc)](https://docs.google.com/document/d/14dEYd_c2NzKDm1EsNFdeQZ9wlO0BAcpNeOif7phi_wE/edit)
+> - The embedding changes: [commit 5dd699e](https://github.com/fastn-ai/documenso-fastn-embed/commit/5dd699e7209be634e1880b12bb11b021d14cdc14)
+> - To enable it, set `FASTN_API_KEY` and `FASTN_BASE_URL` in `.env` (see `.env.example`).
+
 <img src="https://github.com/documenso/documenso/assets/13398220/a643571f-0239-46a6-a73e-6bef38d1228b" alt="Documenso Logo">
 
 <p align="center" style="margin-top: 20px">
