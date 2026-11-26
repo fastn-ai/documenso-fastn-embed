@@ -1,0 +1,237 @@
+import { FieldSchema } from '@documenso/prisma/generated/zod/modelSchema/FieldSchema';
+import { FieldType, Prisma } from '@prisma/client';
+import { z } from 'zod';
+
+import { canFieldTypeBeGrouped } from '../constants/field-groups';
+import {
+  FIELD_SIGNATURE_META_DEFAULT_VALUES,
+  ZCheckboxFieldMeta,
+  ZDateFieldMeta,
+  ZDropdownFieldMeta,
+  ZEmailFieldMeta,
+  ZInitialsFieldMeta,
+  ZNameFieldMeta,
+  ZNumberFieldMeta,
+  ZRadioFieldMeta,
+  ZSignatureFieldMeta,
+  ZTextFieldMeta,
+} from './field-meta';
+
+/**
+ * The full field response schema.
+ *
+ * If you need to return something different, adjust this file to utilise the:
+ * - ZFieldSchema
+ * - ZFieldLiteSchema
+ * - ZFieldManySchema
+ *
+ * Setup similar to:
+ * - ./documents.ts
+ * - ./templates.ts
+ */
+export const ZFieldSchema = FieldSchema.pick({
+  envelopeId: true,
+  envelopeItemId: true,
+  type: true,
+  id: true,
+  secondaryId: true,
+  recipientId: true,
+  page: true,
+  positionX: true,
+  positionY: true,
+  width: true,
+  height: true,
+  customText: true,
+  inserted: true,
+  fieldMeta: true,
+  groupId: true,
+  externalId: true,
+}).extend({
+  // Backwards compatibility.
+  documentId: z.number().nullish(),
+  templateId: z.number().nullish(),
+});
+
+export const ZEnvelopeFieldSchema = ZFieldSchema.omit({
+  documentId: true,
+  templateId: true,
+});
+
+export const FIELD_GROUP_ID_MAX_LENGTH = 255;
+export const FIELD_EXTERNAL_ID_MAX_LENGTH = 255;
+
+export const ZFieldGroupIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(FIELD_GROUP_ID_MAX_LENGTH)
+  .nullish()
+  .describe(
+    'An optional ID used to group fields together. Fields sharing a group ID act as a single logical field: they are inserted together and share validation rules. Every field in a group must belong to the same recipient and be of the same type.',
+  );
+
+export const ZFieldExternalIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(FIELD_EXTERNAL_ID_MAX_LENGTH)
+  .nullish()
+  .describe('An optional external identifier for the field. Not validated or used internally.');
+
+/**
+ * Zod refinement which rejects a group ID on field types that cannot be grouped.
+ *
+ * Usage: `schema.superRefine(refineFieldGroupIdAllowedForType)`
+ */
+export const refineFieldGroupIdAllowedForType = (
+  field: { type: FieldType; groupId?: string | null },
+  ctx: z.RefinementCtx,
+) => {
+  if (field.groupId && !canFieldTypeBeGrouped(field.type)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['groupId'],
+      message: `${field.type} fields cannot be grouped`,
+    });
+  }
+};
+
+export const ZFieldPageNumberSchema = z.number().min(1).describe('The page number the field will be on.');
+
+export const ZFieldPageXSchema = z.number().min(0).describe('The X coordinate of where the field will be placed.');
+
+export const ZFieldPageYSchema = z.number().min(0).describe('The Y coordinate of where the field will be placed.');
+
+export const ZFieldWidthSchema = z.number().min(1).describe('The width of the field.');
+
+export const ZFieldHeightSchema = z.number().min(1).describe('The height of the field.');
+
+export const ZClampedFieldPositionXSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based X coordinate where the field will be placed.');
+
+export const ZClampedFieldPositionYSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based Y coordinate where the field will be placed.');
+
+export const ZClampedFieldWidthSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based width of the field on the page.');
+
+export const ZClampedFieldHeightSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based height of the field on the page.');
+
+// ---------------------------------------------
+
+const PrismaDecimalSchema = z.preprocess(
+  (val) => (typeof val === 'string' ? new Prisma.Decimal(val) : val),
+  z.instanceof(Prisma.Decimal, { message: 'Must be a Decimal' }),
+);
+
+export const BaseFieldSchemaUsingNumbers = ZFieldSchema.extend({
+  positionX: PrismaDecimalSchema,
+  positionY: PrismaDecimalSchema,
+  width: PrismaDecimalSchema,
+  height: PrismaDecimalSchema,
+});
+
+export const ZFieldTextSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.TEXT),
+  fieldMeta: ZTextFieldMeta,
+});
+
+export type TFieldText = z.infer<typeof ZFieldTextSchema>;
+
+export const ZFieldSignatureSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.SIGNATURE),
+  fieldMeta: ZSignatureFieldMeta.catch(FIELD_SIGNATURE_META_DEFAULT_VALUES),
+});
+
+export type TFieldSignature = z.infer<typeof ZFieldSignatureSchema>;
+
+export const ZFieldFreeSignatureSchema = ZFieldSignatureSchema;
+
+export type TFieldFreeSignature = z.infer<typeof ZFieldFreeSignatureSchema>;
+
+export const ZFieldInitialsSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.INITIALS),
+  fieldMeta: ZInitialsFieldMeta,
+});
+
+export type TFieldInitials = z.infer<typeof ZFieldInitialsSchema>;
+
+export const ZFieldNameSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.NAME),
+  fieldMeta: ZNameFieldMeta,
+});
+
+export type TFieldName = z.infer<typeof ZFieldNameSchema>;
+
+export const ZFieldEmailSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.EMAIL),
+  fieldMeta: ZEmailFieldMeta,
+});
+
+export type TFieldEmail = z.infer<typeof ZFieldEmailSchema>;
+
+export const ZFieldDateSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.DATE),
+  fieldMeta: ZDateFieldMeta,
+});
+
+export type TFieldDate = z.infer<typeof ZFieldDateSchema>;
+
+export const ZFieldNumberSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.NUMBER),
+  fieldMeta: ZNumberFieldMeta,
+});
+
+export type TFieldNumber = z.infer<typeof ZFieldNumberSchema>;
+
+export const ZFieldRadioSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.RADIO),
+  fieldMeta: ZRadioFieldMeta,
+});
+
+export type TFieldRadio = z.infer<typeof ZFieldRadioSchema>;
+
+export const ZFieldCheckboxSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.CHECKBOX),
+  fieldMeta: ZCheckboxFieldMeta,
+});
+
+export type TFieldCheckbox = z.infer<typeof ZFieldCheckboxSchema>;
+
+export const ZFieldDropdownSchema = BaseFieldSchemaUsingNumbers.extend({
+  type: z.literal(FieldType.DROPDOWN),
+  fieldMeta: ZDropdownFieldMeta,
+});
+
+export type TFieldDropdown = z.infer<typeof ZFieldDropdownSchema>;
+
+/**
+ * The full field schema which will enforce all types and meta fields.
+ */
+export const ZFullFieldSchema = z.discriminatedUnion('type', [
+  ZFieldTextSchema,
+  ZFieldSignatureSchema,
+  ZFieldInitialsSchema,
+  ZFieldNameSchema,
+  ZFieldEmailSchema,
+  ZFieldDateSchema,
+  ZFieldNumberSchema,
+  ZFieldRadioSchema,
+  ZFieldCheckboxSchema,
+  ZFieldDropdownSchema,
+]);
+
+export type TFullFieldSchema = z.infer<typeof ZFullFieldSchema>;

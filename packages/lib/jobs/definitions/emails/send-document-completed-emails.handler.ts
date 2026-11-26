@@ -1,0 +1,327 @@
+import { AdminRuleEngine } from '@documenso/ee/server-only/admin-rules/admin-rule-engine';
+import { DocumentCompletedEmailTemplate } from '@documenso/email/templates/document-completed';
+import { prisma } from '@documenso/prisma';
+import { msg } from '@lingui/core/macro';
+import { DocumentSource, EnvelopeType, RecipientRole } from '@prisma/client';
+import { createElement } from 'react';
+
+import { getI18nInstance } from '../../../client-only/providers/i18n-server';
+import { NEXT_PUBLIC_WEBAPP_URL } from '../../../constants/app';
+import { getEmailContext } from '../../../server-only/email/get-email-context';
+import { assertOrganisationRatesAndLimits } from '../../../server-only/rate-limit/assert-organisation-rates-and-limits';
+import { DOCUMENT_AUDIT_LOG_TYPE } from '../../../types/document-audit-logs';
+import { extractDerivedDocumentEmailSettings } from '../../../types/document-email';
+import { getFileServerSide } from '../../../universal/upload/get-file.server';
+import { createDocumentAuditLogData } from '../../../utils/document-audit-logs';
+import { unsafeBuildEnvelopeIdQuery } from '../../../utils/envelope';
+import { isRecipientEmailValidForSending } from '../../../utils/recipients';
+import { renderCustomEmailTemplate } from '../../../utils/render-custom-email-template';
+import { renderEmailWithI18N } from '../../../utils/render-email-with-i18n';
+import { formatDocumentsPath } from '../../../utils/teams';
+import type { JobRunIO } from '../../client/_internal/job';
+import type { TSendDocumentCompletedEmailsJobDefinition } from './send-document-completed-emails';
+
+export const run = async ({ payload, io }: { payload: TSendDocumentCompletedEmailsJobDefinition; io: JobRunIO }) => {
+  const { envelopeId, requestMetadata } = payload;
+
+  const envelope = await prisma.envelope.findUnique({
+    where: unsafeBuildEnvelopeIdQuery({ type: 'envelopeId', id: envelopeId }, EnvelopeType.DOCUMENT),
+    include: {
+      envelopeItems: {
+        include: {
+          documentData: {
+            select: {
+              type: true,
+              id: true,
+              data: true,
+            },
+          },
+        },
+      },
+      documentMeta: true,
+      recipients: true,
+      user: {
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          disabled: true,
+          createdAt: true,
+          twoFactorEnabled: true,
+        },
+      },
+      team: {
+        select: {
+          id: true,
+          url: true,
+          name: true,
+        },
+      },
+    },
+  });
+
+  if (!envelope) {
+    throw new Error('Document not found');
+  }
+
+  const isDirectTemplate = envelope?.source === DocumentSource.TEMPLATE_DIRECT_LINK;
+
+  if (envelope.recipients.length === 0) {
+    throw new Error('Document has no recipients');
+  }
+
+  const {
+    branding,
+    emailLanguage,
+    senderEmail,
+    replyToEmail,
+    organisationId,
+    organisationType,
+    organisationName,
+    claims,
+    emailsDisabled,
+    emailTransport,
+  } = await getEmailContext({
+    emailType: 'RECIPIENT',
+    source: {
+      type: 'team',
+      teamId: envelope.teamId,
+    },
+    meta: envelope.documentMeta,
+  });
+
+  // Don't send completion emails if the organisation has email sending disabled or the owner is disabled (e.g. banned).
+  if (envelope.user.disabled || emailsDisabled) {
+    return;
+  }
+
+  const { user: owner } = envelope;
+
+  const emailSettings = extractDerivedDocumentEmailSettings(envelope.documentMeta);
+  const isDocumentCompletedEmailEnabled = emailSettings.documentCompleted;
+  const isOwnerDocumentCompletedEmailEnabled = emailSettings.ownerDocumentCompleted;
+
+  // Send email to document owner if:
+  // 1. Owner document completed emails are enabled AND
+  // 2. Either:
+  //    - The owner is not a recipient, OR
+  //    - Recipient emails are disabled
+  const shouldEmailOwner =
+    isOwnerDocumentCompletedEmailEnabled &&
+    (!envelope.recipients.find((recipient) => recipient.email === owner.email) || !isDocumentCompletedEmailEnabled);
+
+  const recipientsToNotify = isDocumentCompletedEmailEnabled
+    ? envelope.recipients.filter((recipient) => isRecipientEmailValidForSending(recipient))
+    : [];
+
+  // One check covers every completion email, so a block stops them all. So does a rule that turns
+  // off the organisation's emails, as if they were already off.
+  if (shouldEmailOwner || recipientsToNotify.length > 0) {
+    const adminRuleResult = await io.runTask('check-admin-rules', async () => {
+      const adminRuleEngine = new AdminRuleEngine();
+
+      const result = await adminRuleEngine.run({
+        trigger: 'EMAIL_SENT',
+        envelope: {
+          ...envelope,
+          team: {
+            id: envelope.team.id,
+            url: envelope.team.url,
+            name: envelope.team.name,
+            organisation: {
+              id: organisationId,
+              type: organisationType,
+              name: organisationName,
+              organisationClaim: claims,
+            },
+          },
+        },
+        sender: owner,
+        emailType: 'completed',
+        recipients: shouldEmailOwner ? [owner, ...recipientsToNotify] : recipientsToNotify,
+      });
+
+      return {
+        isBlocked: result.isBlocked,
+        hasDisabledEmails: result.hasDisabledEmails,
+      };
+    });
+
+    if (adminRuleResult.isBlocked || adminRuleResult.hasDisabledEmails) {
+      io.logger.info(`Completion emails for envelope ${envelope.id} stopped by an admin rule`);
+
+      return;
+    }
+  }
+
+  const completedDocumentEmailAttachments = await Promise.all(
+    envelope.envelopeItems.map(async (envelopeItem) => {
+      const file = await getFileServerSide(envelopeItem.documentData);
+
+      // Use the envelope title for version 1, and the envelope item title for version 2.
+      const fileNameToUse = envelope.internalVersion === 1 ? envelope.title : envelopeItem.title;
+
+      return {
+        filename: fileNameToUse.endsWith('.pdf') ? fileNameToUse : `${fileNameToUse}.pdf`,
+        content: Buffer.from(file),
+        contentType: 'application/pdf',
+      };
+    }),
+  );
+
+  const assetBaseUrl = NEXT_PUBLIC_WEBAPP_URL() || 'http://localhost:3000';
+
+  let documentOwnerDownloadLink = `${NEXT_PUBLIC_WEBAPP_URL()}${formatDocumentsPath(
+    envelope.team?.url,
+  )}/${envelope.id}`;
+
+  if (envelope.team?.url) {
+    documentOwnerDownloadLink = `${NEXT_PUBLIC_WEBAPP_URL()}/t/${envelope.team.url}/documents/${envelope.id}`;
+  }
+
+  if (shouldEmailOwner) {
+    const template = createElement(DocumentCompletedEmailTemplate, {
+      documentName: envelope.title,
+      assetBaseUrl,
+      downloadLink: documentOwnerDownloadLink,
+    });
+
+    const [html, text] = await Promise.all([
+      renderEmailWithI18N(template, { lang: emailLanguage, branding }),
+      renderEmailWithI18N(template, {
+        lang: emailLanguage,
+        branding,
+        plainText: true,
+      }),
+    ]);
+
+    const i18n = await getI18nInstance(emailLanguage);
+
+    await emailTransport.sendMail({
+      to: [
+        {
+          name: owner.name || '',
+          address: owner.email,
+        },
+      ],
+      from: senderEmail,
+      replyTo: replyToEmail,
+      subject: i18n._(msg`Signing Complete!`),
+      html,
+      text,
+      attachments: completedDocumentEmailAttachments,
+    });
+
+    await prisma.documentAuditLog.create({
+      data: createDocumentAuditLogData({
+        type: DOCUMENT_AUDIT_LOG_TYPE.EMAIL_SENT,
+        envelopeId: envelope.id,
+        user: null,
+        requestMetadata,
+        data: {
+          emailType: 'DOCUMENT_COMPLETED',
+          recipientEmail: owner.email,
+          recipientName: owner.name ?? '',
+          recipientId: owner.id,
+          recipientRole: 'OWNER',
+          isResending: false,
+        },
+      }),
+    });
+  }
+
+  await Promise.all(
+    recipientsToNotify.map(async (recipient) => {
+      // A CC recipient never asked to be part of this document, so their completion
+      // email is effectively unsolicited. Meter it against the organisation email
+      // quota/stats so it is correctly logged.
+      if (recipient.role === RecipientRole.CC) {
+        try {
+          await assertOrganisationRatesAndLimits({
+            organisationId,
+            organisationClaim: claims,
+            type: 'email',
+            count: 1,
+          });
+        } catch (_err) {
+          io.logger.warn({
+            msg: 'CC completion email dropped: org email limit exceeded',
+            organisationId,
+            recipientId: recipient.id,
+            envelopeId: envelope.id,
+          });
+
+          // On rate/quota exceeded, early return to allow other recipients to be processed.
+          return;
+        }
+      }
+
+      const customEmailTemplate = {
+        'signer.name': recipient.name,
+        'signer.email': recipient.email,
+        'document.name': envelope.title,
+      };
+
+      const downloadLink = `${NEXT_PUBLIC_WEBAPP_URL()}/sign/${recipient.token}/complete`;
+      const reportUrl =
+        recipient.role === RecipientRole.CC ? `${NEXT_PUBLIC_WEBAPP_URL()}/report/${recipient.token}` : undefined;
+
+      const template = createElement(DocumentCompletedEmailTemplate, {
+        documentName: envelope.title,
+        assetBaseUrl,
+        downloadLink: recipient.email === owner.email ? documentOwnerDownloadLink : downloadLink,
+        customBody:
+          isDirectTemplate && envelope.documentMeta?.message
+            ? renderCustomEmailTemplate(envelope.documentMeta.message, customEmailTemplate)
+            : undefined,
+        reportUrl,
+      });
+
+      const [html, text] = await Promise.all([
+        renderEmailWithI18N(template, { lang: emailLanguage, branding }),
+        renderEmailWithI18N(template, {
+          lang: emailLanguage,
+          branding,
+          plainText: true,
+        }),
+      ]);
+
+      const i18n = await getI18nInstance(emailLanguage);
+
+      await emailTransport.sendMail({
+        to: [
+          {
+            name: recipient.name,
+            address: recipient.email,
+          },
+        ],
+        from: senderEmail,
+        replyTo: replyToEmail,
+        subject:
+          isDirectTemplate && envelope.documentMeta?.subject
+            ? renderCustomEmailTemplate(envelope.documentMeta.subject, customEmailTemplate)
+            : i18n._(msg`Signing Complete!`),
+        html,
+        text,
+        attachments: completedDocumentEmailAttachments,
+      });
+
+      await prisma.documentAuditLog.create({
+        data: createDocumentAuditLogData({
+          type: DOCUMENT_AUDIT_LOG_TYPE.EMAIL_SENT,
+          envelopeId: envelope.id,
+          user: null,
+          requestMetadata,
+          data: {
+            emailType: 'DOCUMENT_COMPLETED',
+            recipientEmail: recipient.email,
+            recipientName: recipient.name,
+            recipientId: recipient.id,
+            recipientRole: recipient.role,
+            isResending: false,
+          },
+        }),
+      });
+    }),
+  );
+};

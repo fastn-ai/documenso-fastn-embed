@@ -1,0 +1,420 @@
+import { DOCUMENT_AUDIT_LOG_TYPE } from '@documenso/lib/types/document-audit-logs';
+import {
+  FIELD_META_DEFAULT_VALUES,
+  type TFieldMetaSchema as FieldMeta,
+  ZFieldMetaSchema,
+} from '@documenso/lib/types/field-meta';
+import type { ApiRequestMetadata } from '@documenso/lib/universal/extract-request-metadata';
+import { createDocumentAuditLogData, diffFieldChanges } from '@documenso/lib/utils/document-audit-logs';
+import { prisma } from '@documenso/prisma';
+import { EnvelopeType, type Field, type FieldType } from '@prisma/client';
+import { isDeepEqual } from 'remeda';
+
+import { AppError, AppErrorCode } from '../../errors/app-error';
+import type { EnvelopeIdOptions } from '../../utils/envelope';
+import { assertFieldGroupAllowedForType, assertFieldGroupsValid } from '../../utils/field-groups';
+import { assertFieldIdsUnique, mapFieldToLegacyField } from '../../utils/fields';
+import { canRecipientFieldsBeModified } from '../../utils/recipients';
+import { getEnvelopeWhereInput } from '../envelope/get-envelope-by-id';
+import { lockEnvelope } from '../envelope/lock-envelope';
+import { assertFieldMetaProvided, assertFieldMetaValid } from './validate-field-meta';
+
+export interface SetFieldsForDocumentOptions {
+  userId: number;
+  teamId: number;
+  id: EnvelopeIdOptions;
+  fields: FieldData[];
+  requestMetadata: ApiRequestMetadata;
+}
+
+export const setFieldsForDocument = async ({
+  userId,
+  teamId,
+  id,
+  fields,
+  requestMetadata,
+}: SetFieldsForDocumentOptions) => {
+  assertFieldIdsUnique(fields);
+
+  const { envelopeWhereInput } = await getEnvelopeWhereInput({
+    id,
+    type: EnvelopeType.DOCUMENT,
+    userId,
+    teamId,
+  });
+
+  const unlockedEnvelope = await prisma.envelope.findFirst({
+    where: envelopeWhereInput,
+    select: {
+      id: true,
+    },
+  });
+
+  if (!unlockedEnvelope) {
+    throw new AppError(AppErrorCode.NOT_FOUND, {
+      message: 'Document not found',
+    });
+  }
+
+  const { envelope, existingFields, removedFields, persistedFields } = await prisma.$transaction(async (tx) => {
+    await lockEnvelope(tx, unlockedEnvelope.id);
+
+    const envelope = await tx.envelope.findFirst({
+      where: envelopeWhereInput,
+      include: {
+        recipients: true,
+        envelopeItems: {
+          select: {
+            id: true,
+          },
+        },
+        fields: {
+          include: {
+            recipient: true,
+          },
+        },
+      },
+    });
+
+    if (!envelope) {
+      throw new AppError(AppErrorCode.NOT_FOUND, {
+        message: 'Document not found',
+      });
+    }
+
+    if (envelope.completedAt) {
+      throw new AppError(AppErrorCode.INVALID_REQUEST, {
+        message: 'Document already complete',
+      });
+    }
+
+    const existingFields = envelope.fields;
+
+    const removedFields = existingFields.filter(
+      (existingField) => !fields.find((field) => field.id === existingField.id),
+    );
+
+    for (const removedField of removedFields) {
+      if (!canRecipientFieldsBeModified(removedField.recipient, existingFields)) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: 'Recipient has already interacted with the document.',
+        });
+      }
+    }
+
+    const linkedFields = fields.map((field) => {
+      const existing = existingFields.find((existingField) => existingField.id === field.id);
+
+      const recipient = envelope.recipients.find((recipient) => recipient.id === field.recipientId);
+
+      // Check whether the field is being attached to an allowed envelope item.
+      const foundEnvelopeItem = envelope.envelopeItems.find((envelopeItem) => envelopeItem.id === field.envelopeItemId);
+
+      if (!foundEnvelopeItem) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: `Envelope item ${field.envelopeItemId} not found`,
+        });
+      }
+
+      // Each field MUST have a recipient associated with it.
+      if (!recipient) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: `Recipient not found for field ${field.id}`,
+        });
+      }
+
+      // The update keeps the stored recipient, so a payload naming another recipient must not
+      // bypass the stored recipient's check.
+      if (
+        existing &&
+        hasFieldBeenChanged(existing, field) &&
+        (!canRecipientFieldsBeModified(existing.recipient, existingFields) ||
+          !canRecipientFieldsBeModified(recipient, existingFields))
+      ) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: 'Cannot modify a field where the recipient has already interacted with the document',
+        });
+      }
+
+      // Prevent creating new fields when recipient has interacted with the document.
+      if (!existing && !canRecipientFieldsBeModified(recipient, existingFields)) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: 'Cannot modify a field where the recipient has already interacted with the document',
+        });
+      }
+
+      // An omitted value keeps the stored one, an explicit null clears it.
+      const groupId = field.groupId === undefined ? (existing?.groupId ?? null) : field.groupId;
+      const externalId = field.externalId === undefined ? (existing?.externalId ?? null) : field.externalId;
+
+      assertFieldGroupAllowedForType(field.type, groupId);
+
+      // The type of a grouped field can never be changed since it would desync the group.
+      if (existing && existing.type !== field.type && (existing.groupId || groupId)) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: `Cannot change the type of field ${existing.id} because it belongs to a group`,
+        });
+      }
+
+      // An update never moves a field to another recipient or envelope item, so the stored
+      // ones stay. Groups are validated with the values from this payload, which would then
+      // pass for a group which does not match what is stored.
+      const isMovingExistingField =
+        existing !== undefined &&
+        (existing.recipientId !== field.recipientId || existing.envelopeItemId !== field.envelopeItemId);
+
+      if (isMovingExistingField && (existing.groupId || groupId)) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: `Cannot change the recipient or envelope item of field ${existing.id} because it belongs to a group`,
+        });
+      }
+
+      if (groupId && envelope.internalVersion !== 2) {
+        throw new AppError(AppErrorCode.INVALID_REQUEST, {
+          message: 'Field groups are only supported for V2 envelopes',
+        });
+      }
+
+      const parsedFieldMeta = field.fieldMeta
+        ? ZFieldMetaSchema.parse(field.fieldMeta)
+        : FIELD_META_DEFAULT_VALUES[field.type];
+
+      if (envelope.internalVersion === 1) {
+        assertFieldMetaProvided(field.type, field.fieldMeta);
+      }
+
+      if (field.fieldMeta) {
+        assertFieldMetaValid({
+          type: field.type,
+          fieldMeta: field.fieldMeta,
+          groupId,
+          allowTypeMismatch: envelope.internalVersion !== 2,
+        });
+      }
+
+      return {
+        ...field,
+        groupId,
+        externalId,
+        _parsedFieldMeta: parsedFieldMeta,
+        _persisted: existing,
+        _recipient: recipient,
+      };
+    });
+
+    // Since this is a full replace, the payload represents the final state of every field.
+    assertFieldGroupsValid(
+      linkedFields.map((field) => ({
+        id: field.id,
+        type: field.type,
+        recipientId: field.recipientId,
+        groupId: field.groupId,
+        fieldMeta: field._parsedFieldMeta,
+      })),
+    );
+
+    const persistedFields = await Promise.all(
+      linkedFields.map(async (field) => {
+        const fieldSignerEmail = field._recipient.email.toLowerCase();
+
+        const parsedFieldMeta = field._parsedFieldMeta;
+
+        const upsertedField = await tx.field.upsert({
+          where: {
+            id: field._persisted?.id ?? -1,
+            envelopeId: envelope.id,
+            envelopeItemId: field.envelopeItemId,
+          },
+          update: {
+            page: field.pageNumber,
+            positionX: field.pageX,
+            positionY: field.pageY,
+            width: field.pageWidth,
+            height: field.pageHeight,
+            fieldMeta: parsedFieldMeta,
+            groupId: field.groupId,
+            externalId: field.externalId,
+          },
+          create: {
+            type: field.type,
+            page: field.pageNumber,
+            positionX: field.pageX,
+            positionY: field.pageY,
+            width: field.pageWidth,
+            height: field.pageHeight,
+            customText: '',
+            inserted: false,
+            fieldMeta: parsedFieldMeta,
+            groupId: field.groupId,
+            externalId: field.externalId,
+            envelope: {
+              connect: {
+                id: envelope.id,
+              },
+            },
+            envelopeItem: {
+              connect: {
+                id: field.envelopeItemId,
+                envelopeId: envelope.id,
+              },
+            },
+            recipient: {
+              connect: {
+                id: field._recipient.id,
+                envelopeId: envelope.id,
+              },
+            },
+          },
+        });
+
+        if (upsertedField.recipientId === null) {
+          throw new Error('Not possible');
+        }
+
+        const baseAuditLog = {
+          fieldId: upsertedField.secondaryId,
+          fieldRecipientEmail: fieldSignerEmail,
+          fieldRecipientId: upsertedField.recipientId,
+          fieldType: upsertedField.type,
+        };
+
+        const changes = field._persisted ? diffFieldChanges(field._persisted, upsertedField) : [];
+
+        // Handle field updated audit log.
+        if (field._persisted && changes.length > 0) {
+          await tx.documentAuditLog.create({
+            data: createDocumentAuditLogData({
+              type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_UPDATED,
+              envelopeId: envelope.id,
+              metadata: requestMetadata,
+              data: {
+                changes,
+                ...baseAuditLog,
+              },
+            }),
+          });
+        }
+
+        // Handle field created audit log.
+        if (!field._persisted) {
+          await tx.documentAuditLog.create({
+            data: createDocumentAuditLogData({
+              type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_CREATED,
+              envelopeId: envelope.id,
+              metadata: requestMetadata,
+              data: {
+                ...baseAuditLog,
+              },
+            }),
+          });
+        }
+
+        return {
+          ...upsertedField,
+          formId: field.formId,
+        };
+      }),
+    );
+
+    if (removedFields.length > 0) {
+      await tx.field.deleteMany({
+        where: {
+          id: {
+            in: removedFields.map((field) => field.id),
+          },
+        },
+      });
+
+      await tx.documentAuditLog.createMany({
+        data: removedFields.map((field) =>
+          createDocumentAuditLogData({
+            type: DOCUMENT_AUDIT_LOG_TYPE.FIELD_DELETED,
+            envelopeId: envelope.id,
+            metadata: requestMetadata,
+            data: {
+              fieldId: field.secondaryId,
+              fieldRecipientEmail: field.recipient?.email ?? '',
+              fieldRecipientId: field.recipientId ?? -1,
+              fieldType: field.type,
+            },
+          }),
+        ),
+      });
+    }
+
+    return {
+      envelope,
+      existingFields,
+      removedFields,
+      persistedFields,
+    };
+  });
+
+  // Filter out fields that have been removed or have been updated.
+  const mappedFilteredFields = existingFields
+    .filter((field) => {
+      const isRemoved = removedFields.find((removedField) => removedField.id === field.id);
+      const isUpdated = persistedFields.find((persistedField) => persistedField.id === field.id);
+
+      return !isRemoved && !isUpdated;
+    })
+    .map((field) => ({
+      ...mapFieldToLegacyField(field, envelope),
+      formId: undefined,
+    }));
+
+  const mappedPersistentFields = persistedFields.map((field) => ({
+    ...mapFieldToLegacyField(field, envelope),
+    formId: field?.formId,
+  }));
+
+  return {
+    fields: [...mappedFilteredFields, ...mappedPersistentFields],
+  };
+};
+
+/**
+ * If you change this you MUST update the `hasFieldBeenChanged` function.
+ */
+type FieldData = {
+  id?: number | null;
+  formId?: string;
+  envelopeItemId: string;
+  type: FieldType;
+  recipientId: number;
+  pageNumber: number;
+  pageX: number;
+  pageY: number;
+  pageWidth: number;
+  pageHeight: number;
+  fieldMeta?: FieldMeta;
+  /**
+   * Omitted keeps the existing value, null clears it.
+   */
+  groupId?: string | null;
+  /**
+   * Omitted keeps the existing value, null clears it.
+   */
+  externalId?: string | null;
+};
+
+const hasFieldBeenChanged = (field: Field, newFieldData: FieldData) => {
+  const currentFieldMeta = field.fieldMeta || null;
+  const newFieldMeta = newFieldData.fieldMeta || null;
+
+  const hasGroupIdChanged = newFieldData.groupId !== undefined && field.groupId !== newFieldData.groupId;
+  const hasExternalIdChanged = newFieldData.externalId !== undefined && field.externalId !== newFieldData.externalId;
+
+  return (
+    field.envelopeItemId !== newFieldData.envelopeItemId ||
+    field.type !== newFieldData.type ||
+    field.page !== newFieldData.pageNumber ||
+    field.positionX.toNumber() !== newFieldData.pageX ||
+    field.positionY.toNumber() !== newFieldData.pageY ||
+    field.width.toNumber() !== newFieldData.pageWidth ||
+    field.height.toNumber() !== newFieldData.pageHeight ||
+    hasGroupIdChanged ||
+    hasExternalIdChanged ||
+    !isDeepEqual(currentFieldMeta, newFieldMeta)
+  );
+};

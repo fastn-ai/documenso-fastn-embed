@@ -1,0 +1,1192 @@
+import type { AdminRuleEventTeam } from '@documenso/ee/server-only/admin-rules/admin-rule-event';
+import { nanoid, prefixedId } from '@documenso/lib/universal/id';
+import { prisma } from '@documenso/prisma';
+import type { TDirectTemplateSignedFieldValue } from '@documenso/trpc/server/template-router/schema';
+import type { DocumentMeta, Envelope, Field, Recipient, Signature } from '@prisma/client';
+import {
+  DocumentSigningOrder,
+  DocumentSource,
+  DocumentStatus,
+  EnvelopeType,
+  FieldType,
+  Prisma,
+  RecipientRole,
+  SendStatus,
+  SigningStatus,
+  WebhookTriggerEvents,
+} from '@prisma/client';
+import { DateTime } from 'luxon';
+import pMap from 'p-map';
+import { match } from 'ts-pattern';
+import { z } from 'zod';
+
+import { isFieldGroupValueShared } from '../../constants/field-groups';
+import { isBase64Image } from '../../constants/signatures';
+import { AppError, AppErrorCode } from '../../errors/app-error';
+import { jobs } from '../../jobs/client';
+import { DOCUMENT_AUDIT_LOG_TYPE, RECIPIENT_DIFF_TYPE } from '../../types/document-audit-logs';
+import type { TRecipientActionAuthTypes } from '../../types/document-auth';
+import { DocumentAccessAuth, ZRecipientAuthOptionsSchema } from '../../types/document-auth';
+import { extractDerivedDocumentEmailSettings } from '../../types/document-email';
+import { ZFieldMetaSchema } from '../../types/field-meta';
+import { ZSignatureLevelSchema } from '../../types/signature-level';
+import { mapEnvelopeToWebhookDocumentPayload, ZWebhookDocumentSchema } from '../../types/webhook-payload';
+import type { ApiRequestMetadata } from '../../universal/extract-request-metadata';
+import { getFileServerSide } from '../../universal/upload/get-file.server';
+import { putPdfFileServerSide } from '../../universal/upload/put-file.server';
+import { isRequiredField } from '../../utils/advanced-fields-helpers';
+import { extractDerivedDocumentMeta } from '../../utils/document';
+import type { CreateDocumentAuditLogDataResponse } from '../../utils/document-audit-logs';
+import { createDocumentAuditLogData } from '../../utils/document-audit-logs';
+import {
+  createDocumentAuthOptions,
+  createRecipientAuthOptions,
+  extractDocumentAuthMethods,
+} from '../../utils/document-auth';
+import { mapSecondaryIdToTemplateId } from '../../utils/envelope';
+import {
+  assertEnvelopeContentLimits,
+  buildEnvelopeContentCopyData,
+  getContentsMissingImages,
+} from '../../utils/envelope-content';
+import { extractFieldInsertionValues, parseCustomTextAsFieldValue } from '../../utils/envelope-signing';
+import { groupFieldsByGroupId } from '../../utils/field-groups';
+import { assertLegacyFieldValueAllowed, getLegacyReadOnlyFieldValue } from '../../utils/legacy-field-signing';
+import { getRecipientsInActiveSigningStep } from '../../utils/recipient-groups';
+import type { PositionedRecipient } from '../../utils/recipients';
+import {
+  getRecipientsWithMissingFields,
+  isRecipientBefore,
+  sortRecipientsBySigningPosition,
+} from '../../utils/recipients';
+import { assertRecipientFieldsComplete } from '../../utils/signing-items';
+import { loadContentImages } from '../data-content/load-content-images';
+import {
+  assertAdminRulesAllowSend,
+  extractRecipientAutoInsertValues,
+  getSigningRequestRecipients,
+  sendDocument,
+} from '../document/send-document';
+import { validateFieldAuth } from '../document/validate-field-auth';
+import { incrementDocumentId } from '../envelope/increment-id';
+import {
+  RENDER_CONTENTS_CONCURRENCY,
+  renderContentsOntoPdf,
+} from '../envelope-content/insert-contents-into-envelope-item';
+import { assertOrganisationRatesAndLimits } from '../rate-limit/assert-organisation-rates-and-limits';
+import { assignOmittedRecipientSigningOrders } from '../recipient/assign-omitted-recipient-signing-orders';
+import { resolveSignatureLevel } from '../signature-level/resolve-signature-level';
+import { getTeamSettings } from '../team/get-team-settings';
+import { assertUserNotDisabled } from '../user/assert-user-not-disabled';
+import { triggerWebhook } from '../webhooks/trigger/trigger-webhook';
+
+export type CreateDocumentFromDirectTemplateOptions = {
+  directRecipientName?: string;
+  directRecipientEmail: string;
+  directTemplateToken: string;
+  directTemplateExternalId?: string;
+  signedFieldValues: TDirectTemplateSignedFieldValue[];
+  templateUpdatedAt: Date;
+  requestMetadata: ApiRequestMetadata;
+  user?: {
+    id: number;
+    name?: string;
+    email: string;
+  };
+  nextSigner?: {
+    email: string;
+    name: string;
+  };
+};
+
+type CreatedDirectRecipientField = {
+  field: Field & { signature?: Signature | null };
+  derivedRecipientActionAuth?: TRecipientActionAuthTypes;
+};
+
+export const ZCreateDocumentFromDirectTemplateResponseSchema = z.object({
+  token: z.string(),
+  envelopeId: z.string(),
+  documentId: z.number(),
+  recipientId: z.number(),
+});
+
+export type TCreateDocumentFromDirectTemplateResponse = z.infer<typeof ZCreateDocumentFromDirectTemplateResponseSchema>;
+
+export const createDocumentFromDirectTemplate = async ({
+  directRecipientName: initialDirectRecipientName,
+  directRecipientEmail: providedDirectRecipientEmail,
+  directTemplateToken,
+  directTemplateExternalId,
+  signedFieldValues,
+  templateUpdatedAt,
+  nextSigner,
+  requestMetadata,
+  user,
+}: CreateDocumentFromDirectTemplateOptions): Promise<TCreateDocumentFromDirectTemplateResponse> => {
+  const directRecipientEmail = providedDirectRecipientEmail.toLowerCase();
+
+  const directTemplateEnvelope = await prisma.envelope.findFirst({
+    where: {
+      directLink: {
+        token: directTemplateToken,
+      },
+    },
+    include: {
+      recipients: {
+        include: {
+          fields: true,
+        },
+      },
+      directLink: true,
+      envelopeItems: {
+        include: {
+          documentData: true,
+        },
+      },
+      contents: true,
+      documentMeta: true,
+      user: {
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          createdAt: true,
+          twoFactorEnabled: true,
+          disabled: true,
+        },
+      },
+      team: {
+        select: {
+          id: true,
+          url: true,
+          name: true,
+          organisationId: true,
+          organisation: {
+            select: {
+              id: true,
+              type: true,
+              name: true,
+              organisationClaim: {
+                select: {
+                  recipientCount: true,
+                  originalSubscriptionClaimId: true,
+                  envelopeContentCount: true,
+                  envelopeContentImageCount: true,
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!directTemplateEnvelope?.directLink?.enabled) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, { message: 'Invalid or missing template' });
+  }
+
+  const isEnvelopeV2 = directTemplateEnvelope.internalVersion === 2;
+
+  // Mirrors the check in `sendDocument`, which runs too late here: its errors are swallowed once the
+  // document has been created.
+  assertUserNotDisabled(directTemplateEnvelope.user);
+
+  if (
+    nextSigner &&
+    (!directTemplateEnvelope.documentMeta?.allowDictateNextSigner ||
+      directTemplateEnvelope.documentMeta?.signingOrder !== DocumentSigningOrder.SEQUENTIAL)
+  ) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, {
+      message: 'You need to enable allowDictateNextSigner and sequential signing to dictate the next signer',
+    });
+  }
+
+  const directTemplateEnvelopeLegacyId = mapSecondaryIdToTemplateId(directTemplateEnvelope.secondaryId);
+
+  if (directTemplateEnvelope.envelopeItems.length < 1) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, {
+      message: 'Invalid number of envelope items',
+    });
+  }
+
+  const settings = await getTeamSettings({
+    userId: directTemplateEnvelope.userId,
+    teamId: directTemplateEnvelope.teamId,
+  });
+
+  const { recipients, directLink } = directTemplateEnvelope;
+
+  const directTemplateRecipient = recipients.find((recipient) => recipient.id === directLink.directTemplateRecipientId);
+
+  if (!directTemplateRecipient || directTemplateRecipient.role === RecipientRole.CC) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, {
+      message: 'Invalid or missing direct recipient',
+    });
+  }
+
+  const recipientsWithMissingFields = getRecipientsWithMissingFields(
+    recipients,
+    recipients.flatMap((recipient) => recipient.fields),
+  );
+
+  if (recipientsWithMissingFields.length > 0) {
+    throw new AppError(AppErrorCode.MISSING_SIGNATURE_FIELD, {
+      message: 'One or more signers on this direct template are missing a signature field',
+    });
+  }
+
+  // Mirrors the checks in `sendDocument`, which this flow never reaches since
+  // it creates the document directly in PENDING.
+  if (getContentsMissingImages(directTemplateEnvelope.contents).length > 0) {
+    throw new AppError('MISSING_CONTENT_IMAGE', {
+      message: 'One or more image contents on this direct template have no image attached',
+      statusCode: 400,
+    });
+  }
+
+  assertEnvelopeContentLimits(
+    directTemplateEnvelope.contents.map((content) => content.contentMeta.type),
+    directTemplateEnvelope.team.organisation.organisationClaim,
+  );
+
+  if (directTemplateEnvelope.updatedAt.getTime() !== templateUpdatedAt.getTime()) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, { message: 'Template no longer matches' });
+  }
+
+  const { derivedRecipientAccessAuth, documentAuthOption: templateAuthOptions } = extractDocumentAuthMethods({
+    documentAuth: directTemplateEnvelope.authOptions,
+  });
+
+  let directRecipientName = user?.name || initialDirectRecipientName;
+
+  // Ensure typesafety when we add more options.
+  const isAccessAuthValid = match(derivedRecipientAccessAuth.at(0))
+    .with(DocumentAccessAuth.ACCOUNT, () => user && user?.email === directRecipientEmail)
+    .with(DocumentAccessAuth.TWO_FACTOR_AUTH, () => false) // Not supported for direct templates
+    .with(undefined, () => true)
+    .exhaustive();
+
+  if (!isAccessAuthValid) {
+    throw new AppError(AppErrorCode.UNAUTHORIZED, { message: 'You must be logged in' });
+  }
+
+  const directTemplateRecipientAuthOptions = ZRecipientAuthOptionsSchema.parse(directTemplateRecipient.authOptions);
+
+  const nonDirectTemplateRecipients = directTemplateEnvelope.recipients.filter(
+    (recipient) => recipient.id !== directTemplateRecipient.id,
+  );
+
+  // Number unordered recipients by template position since the copies get new ids.
+  const signingOrderByTemplateRecipientId = new Map(
+    assignOmittedRecipientSigningOrders({
+      recipients: sortRecipientsBySigningPosition(recipients),
+    }).map((recipient) => [recipient.id, recipient.signingOrder]),
+  );
+
+  const resolveSigningOrder = (templateRecipientId: number) =>
+    signingOrderByTemplateRecipientId.get(templateRecipientId) ?? null;
+
+  // Carry the template's level forward, coercing if the instance mode has
+  // changed since the template was created. ZSignatureLevelSchema parses the
+  // free-form TEXT column defensively. Resolved before meta extraction so
+  // signingOrder picks up the TSP-appropriate default + assertion.
+  const signatureLevel = resolveSignatureLevel({
+    requested: ZSignatureLevelSchema.parse(directTemplateEnvelope.signatureLevel),
+    strict: false,
+  });
+
+  const derivedDocumentMeta = extractDerivedDocumentMeta(settings, directTemplateEnvelope.documentMeta, signatureLevel);
+
+  // The resulting document contains every non-direct template recipient plus the
+  // direct recipient that is signing now. A recipientCount of 0 means unlimited.
+  // This mirrors the check in `sendDocument`, but must be done here because this
+  // flow creates the document directly in PENDING and swallows `sendDocument` errors.
+  const maximumRecipientCount = directTemplateEnvelope.team.organisation.organisationClaim.recipientCount;
+  const resultingRecipientCount = nonDirectTemplateRecipients.length + 1;
+
+  if (maximumRecipientCount > 0 && resultingRecipientCount > maximumRecipientCount) {
+    throw new AppError('RECIPIENT_LIMIT_EXCEEDED', {
+      message: `You cannot send a document with more than ${maximumRecipientCount} recipients`,
+      statusCode: 400,
+    });
+  }
+
+  // The same values the signing page shows the signer for read only fields.
+  const readOnlyValueByFieldId = new Map(
+    isEnvelopeV2
+      ? extractRecipientAutoInsertValues(directTemplateRecipient.fields, directTemplateRecipient).map(
+          ({ fieldId, customText }) => [fieldId, customText],
+        )
+      : directTemplateRecipient.fields.flatMap((templateField) => {
+          const readOnlyValue = getLegacyReadOnlyFieldValue(templateField);
+
+          return readOnlyValue === null ? [] : [[templateField.id, readOnlyValue] as const];
+        }),
+  );
+
+  // Associate, validate and map to a query every direct template recipient field with the provided fields.
+  // Only process fields that are either required or have been signed by the user
+  const fieldsToProcess = directTemplateRecipient.fields.filter((templateField) => {
+    const signedFieldValue = signedFieldValues.find((value) => value.fieldId === templateField.id);
+
+    // Custom logic for V2 to include all fields, since v1 excludes read only
+    // and prefilled fields.
+    if (isEnvelopeV2) {
+      return true;
+    }
+
+    // Include if it's required, has a signed value, or is read only with a value set by the sender.
+    return (
+      isRequiredField(templateField) || signedFieldValue !== undefined || readOnlyValueByFieldId.has(templateField.id)
+    );
+  });
+
+  const createDirectRecipientFieldArgs = await Promise.all(
+    fieldsToProcess.map(async (templateField) => {
+      const signedFieldValue = signedFieldValues.find((value) => value.fieldId === templateField.id);
+
+      const { type: fieldType } = templateField;
+
+      const isSignatureField = fieldType === FieldType.SIGNATURE || fieldType === FieldType.FREE_SIGNATURE;
+
+      const isReadOnlyField = isEnvelopeV2
+        ? !isSignatureField && fieldType !== FieldType.DATE && Boolean(templateField.fieldMeta?.readOnly)
+        : readOnlyValueByFieldId.has(templateField.id);
+
+      if (isRequiredField(templateField) && !signedFieldValue && !isReadOnlyField) {
+        throw new AppError(AppErrorCode.INVALID_BODY, {
+          message: 'Invalid, missing or changed fields',
+        });
+      }
+
+      if (templateField.type === FieldType.NAME && directRecipientName === undefined) {
+        directRecipientName = signedFieldValue?.value?.trim();
+      }
+
+      const derivedRecipientActionAuth = await validateFieldAuth({
+        documentAuthOptions: directTemplateEnvelope.authOptions,
+        recipient: {
+          authOptions: directTemplateRecipient.authOptions,
+          email: directRecipientEmail,
+          envelopeId: directTemplateEnvelope.id,
+        },
+        field: templateField,
+        userId: user?.id,
+        authOptions: signedFieldValue?.authOptions,
+      });
+
+      // The submitted value is ignored rather than rejected, so a client sending a stale or
+      // missing read only value can still complete.
+      if (isReadOnlyField) {
+        return {
+          templateField,
+          customText: readOnlyValueByFieldId.get(templateField.id) ?? '',
+          derivedRecipientActionAuth,
+          signature: null,
+        };
+      }
+
+      if (!signedFieldValue) {
+        return {
+          templateField,
+          customText: '',
+          derivedRecipientActionAuth,
+          signature: null,
+        };
+      }
+
+      // V1 has always trimmed the submitted values, as V1 signing does. Dropdown and radio values
+      // are option labels, kept as sent so an option starting or ending in a space still matches.
+      const isValueTrimmed = !isEnvelopeV2 && fieldType !== FieldType.DROPDOWN && fieldType !== FieldType.RADIO;
+
+      const value = isValueTrimmed ? signedFieldValue.value?.trim() : signedFieldValue.value;
+
+      if (isSignatureField) {
+        if (!value?.trim()) {
+          throw new AppError(AppErrorCode.INVALID_BODY, {
+            message: 'Signature field must have a signature',
+          });
+        }
+
+        // Decided from the value, not the flag the client sends, since sealing embeds an image
+        // signature as a PNG.
+        const isSignatureImage = isBase64Image(value);
+
+        if (isEnvelopeV2) {
+          extractFieldInsertionValues({
+            fieldValue: { type: FieldType.SIGNATURE, value },
+            field: templateField,
+            documentMeta: derivedDocumentMeta,
+          });
+        } else {
+          assertLegacyFieldValueAllowed({
+            field: templateField,
+            value,
+            isBase64: isSignatureImage,
+            typedSignatureEnabled: derivedDocumentMeta.typedSignatureEnabled,
+          });
+        }
+
+        return {
+          templateField,
+          customText: '',
+          derivedRecipientActionAuth,
+          signature: {
+            signatureImageAsBase64: isSignatureImage ? value : undefined,
+            typedSignature: isSignatureImage ? undefined : value,
+          },
+        };
+      }
+
+      if (fieldType === FieldType.DATE) {
+        return {
+          templateField,
+          customText: DateTime.now().setZone(derivedDocumentMeta.timezone).toFormat(derivedDocumentMeta.dateFormat),
+          derivedRecipientActionAuth,
+          signature: null,
+        };
+      }
+
+      // V1 clients send radio and checkbox values as option labels, which the V2 validation
+      // cannot check, so V1 values are checked as V1 signing checks them.
+      if (!isEnvelopeV2) {
+        const customText = value ?? '';
+
+        // Signing leaves an optional field blank by not inserting it, so blank skips the checks.
+        if (customText !== '' || isRequiredField(templateField)) {
+          assertLegacyFieldValueAllowed({
+            field: templateField,
+            value: customText,
+          });
+        }
+
+        return {
+          templateField,
+          customText,
+          derivedRecipientActionAuth,
+          signature: null,
+        };
+      }
+
+      const { customText } = extractFieldInsertionValues({
+        fieldValue: parseCustomTextAsFieldValue(fieldType, value ?? ''),
+        field: templateField,
+        documentMeta: derivedDocumentMeta,
+      });
+
+      return {
+        templateField,
+        customText,
+        derivedRecipientActionAuth,
+        signature: null,
+      };
+    }),
+  );
+
+  /**
+   * Whether a submitted field should be marked as inserted. On V2, fields in a group act
+   * as one field, so every field is inserted once any field has a value.
+   */
+  const isDirectRecipientFieldInserted = (templateField: Field, customText: string | undefined): boolean => {
+    if (!isEnvelopeV2) {
+      return true;
+    }
+
+    if (customText) {
+      return true;
+    }
+
+    if (!templateField.groupId) {
+      return false;
+    }
+
+    return createDirectRecipientFieldArgs.some(
+      (arg) => arg.templateField.groupId === templateField.groupId && Boolean(arg.customText),
+    );
+  };
+
+  // V1 relies on the required field check made while mapping the submitted values above.
+  if (isEnvelopeV2) {
+    // Every field in a group which shares its value is marked as inserted once any of them
+    // has a value, so a field submitted blank or with another value would end up wrong on
+    // the signed document.
+    const sharedValueFields = createDirectRecipientFieldArgs
+      .filter(({ templateField }) => isFieldGroupValueShared(templateField.type))
+      .map(({ templateField, customText }) => ({ groupId: templateField.groupId, customText: customText ?? '' }));
+
+    for (const [groupId, groupFields] of groupFieldsByGroupId(sharedValueFields)) {
+      if (new Set(groupFields.map((field) => field.customText)).size > 1) {
+        throw new AppError(AppErrorCode.INVALID_BODY, {
+          message: `Fields in group "${groupId}" must all have the same value`,
+        });
+      }
+    }
+
+    // A radio group allows one selection across all of its fields. Signing enforces this
+    // by clearing the other fields when one is selected, but these values arrive together,
+    // so a submission selecting in several fields has to be rejected.
+    const radioFields = createDirectRecipientFieldArgs
+      .filter(({ templateField }) => templateField.type === FieldType.RADIO)
+      .map(({ templateField, customText }) => ({ groupId: templateField.groupId, customText: customText ?? '' }));
+
+    for (const [groupId, groupFields] of groupFieldsByGroupId(radioFields)) {
+      if (groupFields.filter((field) => field.customText !== '').length > 1) {
+        throw new AppError(AppErrorCode.INVALID_BODY, {
+          message: `Only one field in radio group "${groupId}" can have a selection`,
+        });
+      }
+    }
+
+    assertRecipientFieldsComplete({
+      internalVersion: directTemplateEnvelope.internalVersion,
+      recipientId: directTemplateRecipient.id,
+      fields: createDirectRecipientFieldArgs.map(({ templateField, customText, signature }) => ({
+        ...templateField,
+        customText: customText ?? '',
+        inserted: signature !== null || isDirectRecipientFieldInserted(templateField, customText),
+      })),
+    });
+  }
+
+  const directTemplateNonSignatureFields = createDirectRecipientFieldArgs.filter(({ signature }) => signature === null);
+
+  const directTemplateSignatureFields = createDirectRecipientFieldArgs.filter(({ signature }) => signature !== null);
+
+  const envelopeId = prefixedId('envelope');
+
+  // Build a temporary envelope for admin rules checking before the actual document creation.
+  const temporaryEnvelopeForRules = buildEnvelopeForRules({
+    envelopeId,
+    directTemplateEnvelope,
+    signatureLevel,
+    derivedDocumentMeta,
+    nonDirectTemplateRecipients,
+    directTemplateRecipient,
+    directRecipientEmail,
+    nextSigner,
+    resolveSigningOrder,
+  });
+
+  // Checked before anything is created: `sendDocument` only runs once the document exists, and its
+  // errors are swallowed below. Also before the quota is reserved, since a reservation is never
+  // released and a blocked submission creates no document.
+  await assertAdminRulesAllowSend({
+    envelope: temporaryEnvelopeForRules,
+    sender: directTemplateEnvelope.user,
+    recipientsToNotify: getSigningRequestRecipients({ envelope: temporaryEnvelopeForRules }),
+    requestMetadata,
+  });
+
+  // Enforce the organisation document-creation limit before creating the document.
+  await assertOrganisationRatesAndLimits({
+    organisationId: directTemplateEnvelope.team.organisationId,
+    type: 'document',
+    count: 1,
+  });
+
+  const initialRequestTime = new Date();
+
+  // Key = original envelope item ID
+  // Value = duplicated envelope item ID.
+  const oldEnvelopeItemToNewEnvelopeItemIdMap: Record<string, string> = {};
+
+  // The document is created directly in PENDING, so `sendDocument` below will
+  // not insert the contents (it only does so from DRAFT).
+  const contentImages = await loadContentImages(directTemplateEnvelope.contents);
+
+  const envelopeItemsToCreate = await pMap(
+    directTemplateEnvelope.envelopeItems,
+    async (item, i) => {
+      const buffer = await getFileServerSide(item.documentData);
+
+      const titleToUse = item.title || directTemplateEnvelope.title;
+
+      const itemContents = directTemplateEnvelope.contents.filter((content) => content.envelopeItemId === item.id);
+
+      const envelopeItemWithContents = await renderContentsOntoPdf({
+        pdfData: buffer,
+        contents: itemContents,
+        images: contentImages,
+      });
+
+      const { documentData: newDocumentData } = await putPdfFileServerSide(
+        {
+          name: titleToUse,
+          type: 'application/pdf',
+          arrayBuffer: async () => Promise.resolve(envelopeItemWithContents),
+        },
+        // Kept as the initial data so the original PDF survives the rendered contents.
+        item.documentData.data,
+      );
+
+      const newEnvelopeItemId = prefixedId('envelope_item');
+
+      oldEnvelopeItemToNewEnvelopeItemIdMap[item.id] = newEnvelopeItemId;
+
+      return {
+        id: newEnvelopeItemId,
+        title: titleToUse.endsWith('.pdf') ? titleToUse.slice(0, -4) : titleToUse,
+        documentDataId: newDocumentData.id,
+        order: item.order !== undefined ? item.order : i + 1,
+      };
+    },
+    { concurrency: RENDER_CONTENTS_CONCURRENCY },
+  );
+
+  const documentMeta = await prisma.documentMeta.create({
+    data: derivedDocumentMeta,
+  });
+
+  const incrementedDocumentId = await incrementDocumentId();
+
+  const contentsToCreate = buildEnvelopeContentCopyData({
+    contents: directTemplateEnvelope.contents,
+    envelopeId,
+    envelopeItemIdMap: oldEnvelopeItemToNewEnvelopeItemIdMap,
+  });
+
+  const { createdEnvelope, recipientId, token } = await prisma.$transaction(async (tx) => {
+    // Create the envelope and non direct template recipients.
+    const createdEnvelope = await tx.envelope.create({
+      data: {
+        id: envelopeId,
+        secondaryId: incrementedDocumentId.formattedDocumentId,
+        type: EnvelopeType.DOCUMENT,
+        internalVersion: directTemplateEnvelope.internalVersion,
+        signatureLevel,
+        qrToken: prefixedId('qr'),
+        source: DocumentSource.TEMPLATE_DIRECT_LINK,
+        templateId: directTemplateEnvelopeLegacyId,
+        userId: directTemplateEnvelope.userId,
+        teamId: directTemplateEnvelope.teamId,
+        title: directTemplateEnvelope.title,
+        createdAt: initialRequestTime,
+        status: DocumentStatus.PENDING,
+        externalId: directTemplateExternalId,
+        visibility: settings.documentVisibility,
+        envelopeItems: {
+          createMany: {
+            data: envelopeItemsToCreate,
+          },
+        },
+        authOptions: createDocumentAuthOptions({
+          globalAccessAuth: templateAuthOptions.globalAccessAuth,
+          globalActionAuth: templateAuthOptions.globalActionAuth,
+        }),
+        recipients: {
+          createMany: {
+            data: nonDirectTemplateRecipients.map((recipient) => {
+              const authOptions = ZRecipientAuthOptionsSchema.parse(recipient?.authOptions);
+
+              return {
+                email: recipient.email,
+                name: recipient.name,
+                role: recipient.role,
+                authOptions: createRecipientAuthOptions({
+                  accessAuth: authOptions.accessAuth,
+                  actionAuth: authOptions.actionAuth,
+                }),
+                sendStatus: recipient.role === RecipientRole.CC ? SendStatus.SENT : SendStatus.NOT_SENT,
+                signingStatus: recipient.role === RecipientRole.CC ? SigningStatus.SIGNED : SigningStatus.NOT_SIGNED,
+                signingOrder: resolveSigningOrder(recipient.id),
+                token: nanoid(),
+              };
+            }),
+          },
+        },
+        documentMetaId: documentMeta.id,
+      },
+      include: {
+        recipients: true,
+        team: {
+          select: {
+            url: true,
+          },
+        },
+      },
+    });
+
+    if (contentsToCreate.length > 0) {
+      await tx.envelopeContent.createMany({
+        data: contentsToCreate,
+      });
+    }
+
+    let nonDirectRecipientFieldsToCreate: Omit<Field, 'id' | 'secondaryId' | 'templateId'>[] = [];
+
+    Object.values(nonDirectTemplateRecipients).forEach((templateRecipient) => {
+      const recipient = createdEnvelope.recipients.find((recipient) => recipient.email === templateRecipient.email);
+
+      if (!recipient) {
+        throw new Error('Recipient not found.');
+      }
+
+      nonDirectRecipientFieldsToCreate = nonDirectRecipientFieldsToCreate.concat(
+        templateRecipient.fields.map((field) => ({
+          envelopeId: createdEnvelope.id,
+          envelopeItemId: oldEnvelopeItemToNewEnvelopeItemIdMap[field.envelopeItemId],
+          recipientId: recipient.id,
+          type: field.type,
+          page: field.page,
+          positionX: field.positionX,
+          positionY: field.positionY,
+          width: field.width,
+          height: field.height,
+          customText: '',
+          inserted: false,
+          fieldMeta: field.fieldMeta,
+          groupId: field.groupId,
+          externalId: field.externalId,
+        })),
+      );
+    });
+
+    await tx.field.createMany({
+      data: nonDirectRecipientFieldsToCreate.map((field) => ({
+        ...field,
+        fieldMeta: field.fieldMeta ? ZFieldMetaSchema.parse(field.fieldMeta) : undefined,
+      })),
+    });
+
+    // Create the direct recipient and their non signature fields.
+    const createdDirectRecipient = await tx.recipient.create({
+      data: {
+        envelopeId: createdEnvelope.id,
+        email: directRecipientEmail,
+        name: directRecipientName,
+        authOptions: createRecipientAuthOptions({
+          accessAuth: directTemplateRecipientAuthOptions.accessAuth,
+          actionAuth: directTemplateRecipientAuthOptions.actionAuth,
+        }),
+        role: directTemplateRecipient.role,
+        token: nanoid(),
+        signingStatus: SigningStatus.SIGNED,
+        sendStatus: SendStatus.SENT,
+        signedAt: initialRequestTime,
+        signingOrder: resolveSigningOrder(directTemplateRecipient.id),
+        fields: {
+          createMany: {
+            data: directTemplateNonSignatureFields.map(({ templateField, customText }) => {
+              const inserted = isDirectRecipientFieldInserted(templateField, customText);
+
+              return {
+                envelopeId: createdEnvelope.id,
+                envelopeItemId: oldEnvelopeItemToNewEnvelopeItemIdMap[templateField.envelopeItemId],
+                type: templateField.type,
+                page: templateField.page,
+                positionX: templateField.positionX,
+                positionY: templateField.positionY,
+                width: templateField.width,
+                height: templateField.height,
+                customText: customText ?? '',
+                inserted,
+                fieldMeta: templateField.fieldMeta || Prisma.JsonNull,
+                groupId: templateField.groupId,
+                externalId: templateField.externalId,
+              };
+            }),
+          },
+        },
+      },
+      include: {
+        fields: true,
+      },
+    });
+
+    // Create any direct recipient signature fields.
+    // Note: It's done like this because we can't nest things in createMany.
+    const createdDirectRecipientSignatureFields: CreatedDirectRecipientField[] = await Promise.all(
+      directTemplateSignatureFields.map(async ({ templateField, signature, derivedRecipientActionAuth }) => {
+        if (!signature) {
+          throw new Error('Not possible.');
+        }
+
+        const field = await tx.field.create({
+          data: {
+            envelopeId: createdEnvelope.id,
+            envelopeItemId: oldEnvelopeItemToNewEnvelopeItemIdMap[templateField.envelopeItemId],
+            recipientId: createdDirectRecipient.id,
+            type: templateField.type,
+            page: templateField.page,
+            positionX: templateField.positionX,
+            positionY: templateField.positionY,
+            width: templateField.width,
+            height: templateField.height,
+            customText: '',
+            inserted: true,
+            fieldMeta: templateField.fieldMeta || Prisma.JsonNull,
+            externalId: templateField.externalId,
+            signature: {
+              create: {
+                recipientId: createdDirectRecipient.id,
+                signatureImageAsBase64: signature.signatureImageAsBase64,
+                typedSignature: signature.typedSignature,
+              },
+            },
+          },
+          include: {
+            signature: true,
+          },
+        });
+
+        return {
+          field,
+          derivedRecipientActionAuth,
+        };
+      }),
+    );
+
+    const createdDirectRecipientFields: CreatedDirectRecipientField[] = [
+      ...createdDirectRecipient.fields.map((field) => ({
+        field,
+        derivedRecipientActionAuth: undefined,
+      })),
+      ...createdDirectRecipientSignatureFields,
+    ];
+
+    /**
+     * Create the following audit logs.
+     * - DOCUMENT_CREATED
+     * - DOCUMENT_FIELD_INSERTED
+     * - DOCUMENT_RECIPIENT_COMPLETED
+     */
+    const auditLogsToCreate: CreateDocumentAuditLogDataResponse[] = [
+      createDocumentAuditLogData({
+        type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_CREATED,
+        envelopeId: createdEnvelope.id,
+        user: {
+          id: user?.id,
+          name: user?.name,
+          email: directRecipientEmail,
+        },
+        metadata: requestMetadata,
+        data: {
+          title: createdEnvelope.title,
+          source: {
+            type: DocumentSource.TEMPLATE_DIRECT_LINK,
+            templateId: directTemplateEnvelopeLegacyId,
+            directRecipientEmail,
+          },
+        },
+      }),
+      createDocumentAuditLogData({
+        type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_OPENED,
+        envelopeId: createdEnvelope.id,
+        user: {
+          id: user?.id,
+          name: user?.name,
+          email: directRecipientEmail,
+        },
+        metadata: requestMetadata,
+        data: {
+          recipientEmail: createdDirectRecipient.email,
+          recipientId: createdDirectRecipient.id,
+          recipientName: createdDirectRecipient.name,
+          recipientRole: createdDirectRecipient.role,
+          accessAuth: derivedRecipientAccessAuth || undefined,
+        },
+      }),
+      ...createdDirectRecipientFields.map(({ field, derivedRecipientActionAuth }) =>
+        createDocumentAuditLogData({
+          type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_FIELD_INSERTED,
+          envelopeId: createdEnvelope.id,
+          user: {
+            id: user?.id,
+            name: user?.name,
+            email: directRecipientEmail,
+          },
+          metadata: requestMetadata,
+          data: {
+            recipientEmail: createdDirectRecipient.email,
+            recipientId: createdDirectRecipient.id,
+            recipientName: createdDirectRecipient.name,
+            recipientRole: createdDirectRecipient.role,
+            fieldId: field.secondaryId,
+            field: match(field.type)
+              .with(FieldType.SIGNATURE, FieldType.FREE_SIGNATURE, (type) => ({
+                type,
+                data: field.signature?.signatureImageAsBase64 || field.signature?.typedSignature || '',
+              }))
+              .with(
+                FieldType.DATE,
+                FieldType.EMAIL,
+                FieldType.INITIALS,
+                FieldType.NAME,
+                FieldType.TEXT,
+                FieldType.NUMBER,
+                FieldType.CHECKBOX,
+                FieldType.DROPDOWN,
+                FieldType.RADIO,
+                (type) => ({
+                  type,
+                  data: field.customText,
+                }),
+              )
+              .exhaustive(),
+            fieldSecurity: derivedRecipientActionAuth
+              ? {
+                  type: derivedRecipientActionAuth,
+                }
+              : undefined,
+          },
+        }),
+      ),
+      createDocumentAuditLogData({
+        type: DOCUMENT_AUDIT_LOG_TYPE.DOCUMENT_RECIPIENT_COMPLETED,
+        envelopeId: createdEnvelope.id,
+        user: {
+          id: user?.id,
+          name: user?.name,
+          email: directRecipientEmail,
+        },
+        metadata: requestMetadata,
+        data: {
+          recipientEmail: createdDirectRecipient.email,
+          recipientId: createdDirectRecipient.id,
+          recipientName: createdDirectRecipient.name,
+          recipientRole: createdDirectRecipient.role,
+          actionAuth: createdDirectRecipient.authOptions?.actionAuth ?? [],
+        },
+      }),
+    ];
+
+    if (nextSigner) {
+      const pendingRecipients = await tx.recipient.findMany({
+        select: {
+          id: true,
+          signingOrder: true,
+          signingStatus: true,
+          name: true,
+          email: true,
+          role: true,
+        },
+        where: {
+          envelopeId: createdEnvelope.id,
+          signingStatus: {
+            not: SigningStatus.SIGNED,
+          },
+          role: {
+            not: RecipientRole.CC,
+          },
+        },
+        // Composite sort so our next recipient is always the one with the lowest signing order or id
+        // if there is a tie.
+        orderBy: [{ signingOrder: { sort: 'asc', nulls: 'last' } }, { id: 'asc' }],
+      });
+
+      const nextRecipient = getDictatableNextRecipient(pendingRecipients, createdDirectRecipient);
+
+      if (nextRecipient && documentMeta.allowDictateNextSigner) {
+        auditLogsToCreate.push(
+          createDocumentAuditLogData({
+            type: DOCUMENT_AUDIT_LOG_TYPE.RECIPIENT_UPDATED,
+            envelopeId: createdEnvelope.id,
+            user: {
+              name: user?.name || directRecipientName || '',
+              email: user?.email || directRecipientEmail,
+            },
+            metadata: requestMetadata,
+            data: {
+              recipientEmail: nextRecipient.email,
+              recipientName: nextRecipient.name,
+              recipientId: nextRecipient.id,
+              recipientRole: nextRecipient.role,
+              changes: [
+                {
+                  type: RECIPIENT_DIFF_TYPE.NAME,
+                  from: nextRecipient.name,
+                  to: nextSigner.name,
+                },
+                {
+                  type: RECIPIENT_DIFF_TYPE.EMAIL,
+                  from: nextRecipient.email,
+                  to: nextSigner.email.toLowerCase(),
+                },
+              ],
+            },
+          }),
+        );
+
+        await tx.recipient.update({
+          where: { id: nextRecipient.id },
+          data: {
+            name: nextSigner.name,
+            email: nextSigner.email.toLowerCase(),
+          },
+        });
+      }
+    }
+
+    await tx.documentAuditLog.createMany({
+      data: auditLogsToCreate,
+    });
+
+    const templateAttachments = await tx.envelopeAttachment.findMany({
+      where: {
+        envelopeId: directTemplateEnvelope.id,
+      },
+    });
+
+    if (templateAttachments.length > 0) {
+      await tx.envelopeAttachment.createMany({
+        data: templateAttachments.map((attachment) => ({
+          envelopeId: createdEnvelope.id,
+          type: attachment.type,
+          label: attachment.label,
+          data: attachment.data,
+        })),
+      });
+    }
+
+    return {
+      createdEnvelope,
+      token: createdDirectRecipient.token,
+      recipientId: createdDirectRecipient.id,
+    };
+  });
+
+  const emailSettings = extractDerivedDocumentEmailSettings(documentMeta);
+
+  if (emailSettings.ownerDocumentCreated) {
+    await jobs.triggerJob({
+      name: 'send.document.created.from.direct.template.email',
+      payload: {
+        envelopeId: createdEnvelope.id,
+        recipientId,
+      },
+    });
+  }
+
+  try {
+    // This handles sending emails and sealing the document if required.
+    await sendDocument({
+      id: {
+        type: 'envelopeId',
+        id: createdEnvelope.id,
+      },
+      userId: createdEnvelope.userId,
+      teamId: createdEnvelope.teamId,
+      // The admin rules were checked before the document was created.
+      bypassAdminRules: true,
+      requestMetadata,
+    });
+
+    // Refetch envelope so we get the final data.
+    const refetchedEnvelope = await prisma.envelope.findFirstOrThrow({
+      where: {
+        id: createdEnvelope.id,
+      },
+      include: {
+        documentMeta: true,
+        recipients: true,
+      },
+    });
+
+    await triggerWebhook({
+      event: WebhookTriggerEvents.DOCUMENT_SIGNED,
+      data: ZWebhookDocumentSchema.parse(mapEnvelopeToWebhookDocumentPayload(refetchedEnvelope)),
+      userId: refetchedEnvelope.userId,
+      teamId: refetchedEnvelope.teamId ?? undefined,
+    });
+  } catch (err) {
+    console.error('[CREATE_DOCUMENT_FROM_DIRECT_TEMPLATE]:', err);
+
+    // Don't launch an error since the document has already been created.
+    // Log and reseal as required until we configure middleware.
+  }
+
+  return {
+    token,
+    envelopeId: createdEnvelope.id,
+    documentId: incrementedDocumentId.documentId,
+    recipientId,
+  };
+};
+
+type BuildEnvelopeForRulesOptions = {
+  envelopeId: string;
+  directTemplateEnvelope: Pick<Envelope, 'title'> & {
+    team: AdminRuleEventTeam;
+  };
+  signatureLevel: Envelope['signatureLevel'];
+  derivedDocumentMeta: Pick<
+    DocumentMeta,
+    'subject' | 'message' | 'signingOrder' | 'emailSettings' | 'distributionMethod' | 'allowDictateNextSigner'
+  >;
+  nonDirectTemplateRecipients: Pick<Recipient, 'id' | 'email' | 'role'>[];
+  directTemplateRecipient: Pick<Recipient, 'id' | 'role'>;
+  directRecipientEmail: string;
+  nextSigner?: Pick<Recipient, 'email'>;
+  resolveSigningOrder: (templateRecipientId: number) => number | null;
+};
+
+/**
+ * The document a direct-link submission will create, as the admin rules see it. Built before anything
+ * is created, so the rules can block the submission first.
+ */
+const buildEnvelopeForRules = ({
+  envelopeId,
+  directTemplateEnvelope,
+  signatureLevel,
+  derivedDocumentMeta,
+  nonDirectTemplateRecipients,
+  directTemplateRecipient,
+  directRecipientEmail,
+  nextSigner,
+  resolveSigningOrder,
+}: BuildEnvelopeForRulesOptions) => {
+  const otherRecipients = nonDirectTemplateRecipients.map((recipient) => ({
+    email: recipient.email,
+    role: recipient.role,
+    signingOrder: resolveSigningOrder(recipient.id),
+    signingStatus: recipient.role === RecipientRole.CC ? SigningStatus.SIGNED : SigningStatus.NOT_SIGNED,
+    sendStatus: recipient.role === RecipientRole.CC ? SendStatus.SENT : SendStatus.NOT_SENT,
+  }));
+
+  const directRecipient = {
+    email: directRecipientEmail,
+    role: directTemplateRecipient.role,
+    signingOrder: resolveSigningOrder(directTemplateRecipient.id),
+    signingStatus: SigningStatus.SIGNED,
+    sendStatus: SendStatus.SENT,
+  };
+
+  // If the visitor dictates the next signer, that recipient ends up with the email they entered.
+  if (nextSigner && derivedDocumentMeta.allowDictateNextSigner) {
+    const dictatedRecipient = getDictatableNextRecipient(otherRecipients, directRecipient);
+
+    if (dictatedRecipient) {
+      dictatedRecipient.email = nextSigner.email;
+    }
+  }
+
+  return {
+    id: envelopeId,
+    title: directTemplateEnvelope.title,
+    source: DocumentSource.TEMPLATE_DIRECT_LINK,
+    signatureLevel,
+    documentMeta: derivedDocumentMeta,
+    recipients: [...otherRecipients, directRecipient],
+    team: directTemplateEnvelope.team,
+  };
+};
+
+/**
+ * The recipient the direct recipient may dictate: the only recipient in the next signing step.
+ */
+const getDictatableNextRecipient = <T extends Pick<Recipient, 'role' | 'signingStatus'> & PositionedRecipient>(
+  recipients: T[],
+  directRecipient: PositionedRecipient,
+) => {
+  const nextRecipients = getRecipientsInActiveSigningStep(recipients);
+
+  // The direct recipient can share a step with other recipients (a signing
+  // group). Those peers are still pending, so without this check they would
+  // look like the "next" step and be dictated over — dictation may only
+  // affect a strictly later step.
+  const hasCompletedCurrentStep = nextRecipients.every((recipient) => isRecipientBefore(directRecipient, recipient));
+
+  // Dictation can only apply when the next step is a single recipient.
+  return hasCompletedCurrentStep && nextRecipients.length === 1 ? nextRecipients[0] : null;
+};

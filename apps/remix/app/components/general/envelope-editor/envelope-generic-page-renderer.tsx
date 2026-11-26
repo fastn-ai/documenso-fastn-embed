@@ -1,0 +1,236 @@
+import { useAnalytics } from '@documenso/lib/client-only/hooks/use-analytics';
+import { usePageRenderer } from '@documenso/lib/client-only/hooks/use-page-renderer';
+import {
+  type PageRenderData,
+  useCurrentEnvelopeRender,
+} from '@documenso/lib/client-only/providers/envelope-render-provider';
+import type { TEnvelope } from '@documenso/lib/types/envelope';
+import { renderStaticContents } from '@documenso/lib/universal/content-renderer/render-static-contents';
+import { renderField } from '@documenso/lib/universal/field-renderer/render-field';
+import { areContentsImprinted } from '@documenso/lib/utils/envelope';
+import { getClientSideFieldTranslations } from '@documenso/lib/utils/fields';
+import { EnvelopeRecipientFieldTooltip } from '@documenso/ui/components/document/envelope-recipient-field-tooltip';
+import { useLingui } from '@lingui/react/macro';
+import { DocumentStatus, type Recipient, SigningStatus } from '@prisma/client';
+import type Konva from 'konva';
+import { useEffect, useMemo } from 'react';
+
+type GenericLocalField = TEnvelope['fields'][number] & {
+  recipient: Pick<Recipient, 'id' | 'name' | 'email' | 'signingStatus'>;
+};
+
+export const EnvelopeGenericPageRenderer = ({ pageData }: { pageData: PageRenderData }) => {
+  const { i18n } = useLingui();
+  const analytics = useAnalytics();
+
+  const {
+    version,
+    envelopeStatus,
+    currentEnvelopeItem,
+    fields,
+    contents,
+    contentImages,
+    signatures,
+    recipients,
+    getRecipientColorKey,
+    setRenderError,
+    overrideSettings,
+  } = useCurrentEnvelopeRender();
+
+  // Once sent, the contents are baked into the current PDF, so rendering them again doubles them up.
+  const shouldRenderContents = !(version === 'current' && areContentsImprinted(envelopeStatus));
+
+  const signaturesByFieldId = useMemo(() => {
+    return new Map(signatures.map((signature) => [signature.fieldId, signature]));
+  }, [signatures]);
+
+  const {
+    stage,
+    pageLayer,
+    konvaContainer,
+    unscaledViewport,
+    fieldsVisibility,
+    applyPageItemsVisibility,
+    hasFailedImage,
+  } = usePageRenderer(({ stage, pageLayer }) => {
+    createPageCanvas(stage, pageLayer);
+  }, pageData);
+
+  const { scale, pageNumber } = pageData;
+
+  // A failed image would render the page differently to how it was authored.
+  useEffect(() => {
+    if (shouldRenderContents && hasFailedImage) {
+      setRenderError(true);
+    }
+  }, [shouldRenderContents, hasFailedImage]);
+
+  const localPageFields = useMemo((): GenericLocalField[] => {
+    if (envelopeStatus === DocumentStatus.COMPLETED) {
+      return [];
+    }
+
+    return fields
+      .filter((field) => field.page === pageNumber && field.envelopeItemId === currentEnvelopeItem?.id)
+      .map((field) => {
+        const recipient = recipients.find((recipient) => recipient.id === field.recipientId);
+
+        if (!recipient) {
+          throw new Error(`Recipient not found for field ${field.id}`);
+        }
+
+        const isInserted = recipient.signingStatus === SigningStatus.SIGNED && field.inserted;
+
+        return {
+          ...field,
+          inserted: isInserted,
+          customText: isInserted ? field.customText : '',
+          recipient,
+        };
+      })
+      .filter(
+        ({ inserted, fieldMeta, recipient }) =>
+          (recipient.signingStatus === SigningStatus.SIGNED ? inserted : true) || fieldMeta?.readOnly,
+      );
+  }, [fields, pageNumber, currentEnvelopeItem?.id, recipients, envelopeStatus]);
+
+  const unsafeRenderFieldOnLayer = (field: GenericLocalField) => {
+    if (!pageLayer.current) {
+      console.error('Layer not loaded yet');
+      return;
+    }
+
+    const fieldTranslations = getClientSideFieldTranslations(i18n);
+
+    // Look up an inserted signature for this field. If we don't have one (e.g.
+    // the signatures haven't been loaded, or the field hasn't been signed yet)
+    // fall back to a placeholder so the field still renders something.
+    const insertedSignature = signaturesByFieldId.get(field.id);
+
+    const signature = insertedSignature ?? {
+      signatureImageAsBase64: '',
+      typedSignature: fieldTranslations.SIGNATURE,
+    };
+
+    renderField({
+      scale,
+      pageLayer: pageLayer.current,
+      field: {
+        renderId: field.id.toString(),
+        ...field,
+        width: Number(field.width),
+        height: Number(field.height),
+        positionX: Number(field.positionX),
+        positionY: Number(field.positionY),
+        fieldMeta: field.fieldMeta,
+        signature,
+      },
+      translations: fieldTranslations,
+      pageWidth: unscaledViewport.width,
+      pageHeight: unscaledViewport.height,
+      color: fieldsVisibility === 'muted' ? 'readOnly' : getRecipientColorKey(field.recipientId),
+      editable: false,
+      mode: overrideSettings?.mode ?? 'edit',
+    });
+  };
+
+  const renderFieldOnLayer = (field: GenericLocalField) => {
+    try {
+      unsafeRenderFieldOnLayer(field);
+    } catch (err) {
+      console.error(err);
+
+      analytics.captureException(err, {
+        source: 'editor',
+        location: 'envelope_page_render',
+        envelopeId: currentEnvelopeItem?.envelopeId,
+      });
+
+      setRenderError(true);
+    }
+  };
+
+  /**
+   * Initialize the Konva page canvas and all fields and interactions.
+   */
+  const createPageCanvas = (_currentStage: Konva.Stage, currentPageLayer: Konva.Layer) => {
+    // Contents must be rendered before the fields so they sit beneath them.
+    if (shouldRenderContents) {
+      renderContents(currentPageLayer);
+    }
+
+    // Render the fields.
+    for (const field of localPageFields) {
+      renderFieldOnLayer(field);
+    }
+
+    currentPageLayer.batchDraw();
+  };
+
+  const renderContents = (currentPageLayer: Konva.Layer) => {
+    try {
+      renderStaticContents({
+        contents: contents.filter(
+          (content) => content.contentMeta.page === pageNumber && content.envelopeItemId === currentEnvelopeItem?.id,
+        ),
+        pageLayer: currentPageLayer,
+        pageWidth: unscaledViewport.width,
+        pageHeight: unscaledViewport.height,
+        scale,
+        mode: overrideSettings?.mode ?? 'edit',
+        images: contentImages.images,
+      });
+    } catch (err) {
+      console.error(err);
+      setRenderError(true);
+    }
+  };
+
+  /**
+   * Render fields when they are added or removed
+   */
+  useEffect(() => {
+    if (!pageLayer.current || !stage.current) {
+      return;
+    }
+
+    // If doesn't exist in localFields, destroy it since it's been deleted.
+    pageLayer.current.find('Group').forEach((group) => {
+      if (group.name() === 'field-group' && !localPageFields.some((field) => field.id.toString() === group.id())) {
+        group.destroy();
+      }
+    });
+
+    // If it exists, rerender.
+    localPageFields.forEach((field) => {
+      renderFieldOnLayer(field);
+    });
+
+    applyPageItemsVisibility();
+
+    pageLayer.current.batchDraw();
+  }, [localPageFields, signaturesByFieldId, fieldsVisibility]);
+
+  if (!currentEnvelopeItem) {
+    return null;
+  }
+
+  return (
+    <>
+      {overrideSettings?.showRecipientTooltip &&
+        pageData.imageLoadingState === 'loaded' &&
+        fieldsVisibility === 'visible' &&
+        localPageFields.map((field) => (
+          <EnvelopeRecipientFieldTooltip
+            key={field.id}
+            field={field}
+            showFieldStatus={overrideSettings?.showRecipientSigningStatus}
+            showRecipientTooltip={overrideSettings?.showRecipientTooltip}
+          />
+        ))}
+
+      {/* The element Konva will inject it's canvas into. */}
+      <div className="konva-container absolute inset-0 z-10 w-full" ref={konvaContainer}></div>
+    </>
+  );
+};

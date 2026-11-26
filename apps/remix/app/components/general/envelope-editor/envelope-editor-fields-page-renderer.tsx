@@ -1,0 +1,293 @@
+import { usePageRenderer } from '@documenso/lib/client-only/hooks/use-page-renderer';
+import { useCurrentEnvelopeEditor } from '@documenso/lib/client-only/providers/envelope-editor-provider';
+import {
+  type PageRenderData,
+  useCurrentEnvelopeRender,
+} from '@documenso/lib/client-only/providers/envelope-render-provider';
+import { useCurrentOrganisation } from '@documenso/lib/client-only/providers/organisation';
+import { EnvelopeContentType } from '@documenso/lib/types/envelope-content-meta';
+import { getContentTransformerConfig } from '@documenso/lib/universal/content-renderer/content-geometry';
+import { DEFAULT_TRANSFORMER_SELECTION_CONFIG } from '@documenso/lib/universal/konva/transformer';
+import { canContentBeChanged } from '@documenso/lib/utils/envelope';
+import { resolveEnvelopeContentLimits } from '@documenso/lib/utils/envelope-content';
+import { useLingui } from '@lingui/react/macro';
+import Konva from 'konva';
+import type { KonvaEventObject } from 'konva/lib/Node';
+import { CopyPlusIcon, TrashIcon } from 'lucide-react';
+import { useEffect } from 'react';
+import { match } from 'ts-pattern';
+import {
+  EnvelopeCanvasActionBar,
+  EnvelopeCanvasActionButton,
+  EnvelopeCanvasActionButtonGroup,
+} from './canvas/envelope-canvas-action-bar';
+import { EnvelopeCanvasContentActions } from './canvas/envelope-canvas-content-actions';
+import { EnvelopeCanvasFieldActionButtons } from './canvas/envelope-canvas-field-action-buttons';
+import { EnvelopeCanvasPendingContentMenu } from './canvas/envelope-canvas-pending-content-menu';
+import { EnvelopeCanvasPendingFieldMenu } from './canvas/envelope-canvas-pending-field-menu';
+import type {
+  EnvelopeCanvas,
+  EnvelopeCanvasSelection,
+  EnvelopeCanvasSelectionKind,
+} from './canvas/envelope-canvas-types';
+import { ENVELOPE_CANVAS_GROUP_NAMES } from './canvas/envelope-canvas-types';
+import { useEnvelopeCanvasContentsLayer } from './canvas/use-envelope-canvas-contents-layer';
+import { useEnvelopeCanvasFieldsLayer } from './canvas/use-envelope-canvas-fields-layer';
+import { useEnvelopeCanvasLineAnchors } from './canvas/use-envelope-canvas-line-anchors';
+import { useEnvelopeCanvasMarquee } from './canvas/use-envelope-canvas-marquee';
+import { useEnvelopeCanvasSelection } from './canvas/use-envelope-canvas-selection';
+import { contentButtonList } from './envelope-editor-content-drag-drop';
+
+const getNodeSelectionKind = (node: Konva.Node): EnvelopeCanvasSelectionKind | null => {
+  if (node.hasName(ENVELOPE_CANVAS_GROUP_NAMES.field)) {
+    return 'field';
+  }
+
+  if (node.hasName(ENVELOPE_CANVAS_GROUP_NAMES.content)) {
+    return 'content';
+  }
+
+  return null;
+};
+
+export const EnvelopeEditorFieldsPageRenderer = ({ pageData }: { pageData: PageRenderData }) => {
+  const { t } = useLingui();
+  const { envelope, editorFields, editorContents, selectedEditorTab, isPlacingItem } = useCurrentEnvelopeEditor();
+  const { currentEnvelopeItem } = useCurrentEnvelopeRender();
+  const organisation = useCurrentOrganisation();
+
+  const { scale, pageNumber } = pageData;
+
+  const { isContentLimitReached, isImageLimitReached } = resolveEnvelopeContentLimits(
+    editorContents.localContents.map((content) => content.contentMeta.type),
+    organisation.organisationClaim,
+  );
+
+  const {
+    stage,
+    pageLayer,
+    konvaContainer,
+    scaledViewport,
+    unscaledViewport,
+    fieldsVisibility,
+    contentsVisibility,
+    applyPageItemsVisibility,
+  } = usePageRenderer(({ stage, pageLayer }) => createPageCanvas(stage, pageLayer), pageData, {
+    fieldsVisibility: selectedEditorTab === 'contents' ? 'muted' : 'visible',
+  });
+
+  const canvas: EnvelopeCanvas = { stage, pageLayer, scale, pageNumber, unscaledViewport, scaledViewport };
+
+  const isContentsEditable =
+    selectedEditorTab === 'contents' && canContentBeChanged(envelope) && contentsVisibility === 'visible';
+
+  const syncEditorSelection = (selection: EnvelopeCanvasSelection) => {
+    const singleFormId = selection?.groups.length === 1 ? selection.groups[0].id() : null;
+
+    editorFields.setSelectedField(selection?.kind === 'field' ? singleFormId : null);
+    editorContents.setSelectedContent(selection?.kind === 'content' ? singleFormId : null);
+  };
+
+  const selection = useEnvelopeCanvasSelection({
+    getTransformerConfig: (kind, groups) => {
+      if (kind === 'field') {
+        return DEFAULT_TRANSFORMER_SELECTION_CONFIG;
+      }
+
+      const selectedContents = groups.map((group) => editorContents.getContentByFormId(group.id()));
+
+      return getContentTransformerConfig(
+        selectedContents.map((content) => content?.contentMeta.type),
+        { hasImage: selectedContents.length === 1 && Boolean(selectedContents[0]?.dataContentId) },
+      );
+    },
+    onChange: syncEditorSelection,
+  });
+
+  const fields = useEnvelopeCanvasFieldsLayer({ canvas, selection, fieldsVisibility, applyPageItemsVisibility });
+
+  const contents = useEnvelopeCanvasContentsLayer({
+    canvas,
+    selection,
+    isEditable: isContentsEditable,
+    isContentLimitReached,
+    applyPageItemsVisibility,
+  });
+
+  const lineAnchors = useEnvelopeCanvasLineAnchors({
+    canvas,
+    selection,
+    isEditable: isContentsEditable,
+    localPageContents: contents.localPageContents,
+  });
+
+  const marquee = useEnvelopeCanvasMarquee({
+    onSelect: (box) => (isContentsEditable ? contents.selectInBox(box) : fields.selectInBox(box)),
+    onEmptyClick: selection.clear,
+  });
+
+  // The action bar and pending menus are DOM elements above the canvas, so a
+  // placement click landing on one would press its button as well as placing the
+  // item, and by then the button acts on the item just placed (e.g. removing it).
+  useEffect(() => {
+    if (!isPlacingItem) {
+      return;
+    }
+
+    fields.clearPending();
+    contents.clearPending();
+    selection.clear();
+
+    pageLayer.current?.batchDraw();
+  }, [isPlacingItem]);
+
+  const createPageCanvas = (currentStage: Konva.Stage, currentPageLayer: Konva.Layer) => {
+    selection.attach(currentPageLayer);
+
+    // Render the contents first so they sit beneath the fields.
+    contents.renderAll();
+    fields.renderAll();
+
+    // The stage is rebuilt on zoom, so anything selected beforehand is now
+    // pointing at the nodes which were just thrown away.
+    selection.reattachSelection(currentPageLayer);
+
+    marquee.bind(currentStage, currentPageLayer);
+
+    currentStage.on('mousedown', (e) => {
+      fields.clearPending();
+      contents.clearPending();
+
+      if (e.target === currentStage) {
+        selection.clear();
+        currentPageLayer.batchDraw();
+      }
+    });
+
+    // When an item is dragged, select it automatically.
+    const onDragStartOrEnd = (e: KonvaEventObject<Event>) => {
+      fields.clearPending();
+      contents.clearPending();
+
+      const kind = getNodeSelectionKind(e.target);
+
+      if (!kind) {
+        return;
+      }
+
+      selection.setIsTransforming(e.type === 'dragstart');
+
+      // Do nothing and allow the transformer to handle it.
+      // Required so when multiple items are selected, this won't deselect them.
+      if (selection.isSelected(e.target)) {
+        return;
+      }
+
+      selection.select(kind, [e.target]);
+    };
+
+    currentStage.on('dragstart', onDragStartOrEnd);
+    currentStage.on('dragend', onDragStartOrEnd);
+
+    // Hover is resolved from whatever is under the pointer on every move, rather than from
+    // per field enter and leave events, because Konva never reports the pointer leaving a
+    // field which was re-rendered underneath it.
+    currentStage.on('mousemove', (event) => {
+      const parent = event.target.getParent();
+
+      // The transformer is drawn over the selected field, so the pointer hits it instead.
+      const hoveredFieldGroup =
+        event.target.findAncestor(`.${ENVELOPE_CANVAS_GROUP_NAMES.field}`, true) ??
+        (parent instanceof Konva.Transformer && parent.nodes().length === 1 ? parent.nodes()[0] : null);
+
+      // This handler is bound once when the stage is created, which is safe here because
+      // the lookup reads the live form values rather than a render's copy of the fields.
+      const hoveredField = hoveredFieldGroup ? editorFields.getFieldByFormId(hoveredFieldGroup.id()) : undefined;
+
+      fields.setHoveredGroupedFieldFormId(hoveredField?.groupId ? hoveredField.formId : null);
+    });
+
+    currentStage.on('mouseleave', () => fields.setHoveredGroupedFieldFormId(null));
+
+    currentPageLayer.batchDraw();
+  };
+
+  if (!currentEnvelopeItem) {
+    return null;
+  }
+
+  const { selection: currentSelection, isTransforming } = selection;
+
+  const selectedSingleContent = match(currentSelection)
+    .with({ kind: 'content' }, ({ groups }) =>
+      groups.length === 1 ? (editorContents.getContentByFormId(groups[0].id()) ?? null) : null,
+    )
+    .otherwise(() => null);
+
+  const selectedContents = match(currentSelection)
+    .with({ kind: 'content' }, ({ groups }) =>
+      groups.flatMap((group) => editorContents.getContentByFormId(group.id()) ?? []),
+    )
+    .otherwise(() => []);
+
+  const canSelectionBeDuplicated =
+    !isContentLimitReached &&
+    !(
+      isImageLimitReached && selectedContents.some((content) => content.contentMeta.type === EnvelopeContentType.IMAGE)
+    );
+
+  const creatableContentItems = contentButtonList.filter(
+    (item) => !isImageLimitReached || item.type !== EnvelopeContentType.IMAGE,
+  );
+
+  return (
+    <>
+      {currentSelection?.kind === 'field' && (
+        <EnvelopeCanvasActionBar nodes={currentSelection.groups} hidden={isTransforming}>
+          <EnvelopeCanvasFieldActionButtons
+            selectedFieldFormIds={currentSelection.groups.map((group) => group.id())}
+            onDuplicate={fields.duplicateSelected}
+            onDuplicateOnAllPages={fields.duplicateSelectedOnAllPages}
+            onDelete={fields.deleteSelected}
+            onChangeRecipient={fields.changeSelectedRecipient}
+            onChangeFieldType={fields.changeSelectedType}
+          />
+        </EnvelopeCanvasActionBar>
+      )}
+
+      {currentSelection?.kind === 'content' && (
+        <EnvelopeCanvasActionBar nodes={currentSelection.groups} hidden={isTransforming || lineAnchors.isDragging}>
+          <EnvelopeCanvasActionButtonGroup>
+            {selectedSingleContent && <EnvelopeCanvasContentActions content={selectedSingleContent} />}
+
+            {/* Duplicating adds a content, so it is hidden once the organisation's allowance is used up. */}
+            {canSelectionBeDuplicated && (
+              <EnvelopeCanvasActionButton
+                title={t`Duplicate`}
+                icon={CopyPlusIcon}
+                onClick={contents.duplicateSelected}
+              />
+            )}
+
+            <EnvelopeCanvasActionButton title={t`Remove`} icon={TrashIcon} onClick={contents.deleteSelected} />
+          </EnvelopeCanvasActionButtonGroup>
+        </EnvelopeCanvasActionBar>
+      )}
+
+      {fields.pendingCreation && (
+        <EnvelopeCanvasActionBar nodes={[fields.pendingCreation]}>
+          <EnvelopeCanvasPendingFieldMenu onSelectType={fields.createFromPending} />
+        </EnvelopeCanvasActionBar>
+      )}
+
+      {contents.pendingCreation && (
+        <EnvelopeCanvasActionBar nodes={[contents.pendingCreation]}>
+          <EnvelopeCanvasPendingContentMenu items={creatableContentItems} onSelectItem={contents.createFromPending} />
+        </EnvelopeCanvasActionBar>
+      )}
+
+      {/* The element Konva will inject it's canvas into. */}
+      <div className="konva-container absolute inset-0 z-10 w-full" ref={konvaContainer}></div>
+    </>
+  );
+};

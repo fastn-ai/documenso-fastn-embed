@@ -1,0 +1,131 @@
+import { AdminRuleEngine } from '@documenso/ee/server-only/admin-rules/admin-rule-engine';
+import { sendOrganisationAccountLinkConfirmationEmail } from '@documenso/ee/server-only/lib/send-organisation-account-link-confirmation-email';
+import { formatPath } from '@documenso/lib/constants/app';
+import { isDisposableEmail, isSignupEnabledForProvider } from '@documenso/lib/constants/auth';
+import { AppError } from '@documenso/lib/errors/app-error';
+import { getEmailBlocklistDomains } from '@documenso/lib/server-only/site-settings/get-email-blocklist-domains';
+import { onCreateUserHook } from '@documenso/lib/server-only/user/create-user';
+import { UserAuthMethod } from '@documenso/lib/types/user-auth-method';
+import { findUserByProvidedEmail } from '@documenso/lib/server-only/user/find-user-by-provided-email';
+import { formatOrganisationLoginUrl } from '@documenso/lib/utils/organisation-authentication-portal';
+import { prisma } from '@documenso/prisma';
+import type { Context } from 'hono';
+
+import { AuthenticationErrorCode } from '../errors/error-codes';
+import { onAuthorize } from './authorizer';
+import { validateOauth } from './handle-oauth-callback-url';
+import { getOrganisationAuthenticationPortalOptions } from './organisation-portal';
+
+type HandleOAuthOrganisationCallbackUrlOptions = {
+  c: Context;
+  orgUrl: string;
+};
+
+export const handleOAuthOrganisationCallbackUrl = async (options: HandleOAuthOrganisationCallbackUrlOptions) => {
+  const { c, orgUrl } = options;
+
+  const { organisation, clientOptions } = await getOrganisationAuthenticationPortalOptions({
+    type: 'url',
+    organisationUrl: orgUrl,
+  });
+
+  const { email, name, sub, accessToken, accessTokenExpiresAt, idToken } = await validateOauth({
+    c,
+    clientOptions: {
+      ...clientOptions,
+      bypassEmailVerification: true, // Bypass for organisation OIDC because we manually verify the email.
+    },
+  });
+
+  const allowedDomains = organisation.organisationAuthenticationPortal.allowedDomains;
+
+  const isEmailDomainAllowed = allowedDomains.some((domain) =>
+    email.toLowerCase().endsWith(`@${domain.toLowerCase()}`),
+  );
+
+  if (allowedDomains.length > 0 && !isEmailDomainAllowed) {
+    throw new AppError(AuthenticationErrorCode.InvalidRequest, {
+      message: 'Email domain not allowed',
+    });
+  }
+
+  // Find the account if possible.
+  const existingAccount = await prisma.account.findFirst({
+    where: {
+      provider: clientOptions.id,
+      providerAccountId: sub,
+    },
+    include: {
+      user: true,
+    },
+  });
+
+  // Directly log in user if account already exists.
+  if (existingAccount) {
+    await onAuthorize({ userId: existingAccount.user.id }, c);
+
+    return c.redirect(formatPath(`/o/${orgUrl}`), 302);
+  }
+
+  let userToLink = await findUserByProvidedEmail({ email });
+
+  // Handle new user.
+  if (!userToLink) {
+    if (!isSignupEnabledForProvider('oidc')) {
+      const errorUrl = new URL(formatOrganisationLoginUrl(orgUrl));
+
+      errorUrl.searchParams.set('error', AuthenticationErrorCode.SignupDisabled);
+
+      return c.redirect(errorUrl.toString(), 302);
+    }
+
+    // Reject disposable / throwaway email providers for new SSO users.
+    const additionalBlockedDomains = await getEmailBlocklistDomains();
+
+    if (isDisposableEmail(email, additionalBlockedDomains)) {
+      const errorUrl = new URL(formatOrganisationLoginUrl(orgUrl));
+
+      errorUrl.searchParams.set('error', AuthenticationErrorCode.SignupDisposableEmail);
+
+      return c.redirect(errorUrl.toString(), 302);
+    }
+
+    userToLink = await prisma.user.create({
+      data: {
+        email: email.toLowerCase(),
+        name: name,
+        emailVerified: null, // Do not verify email.
+      },
+    });
+
+    await onCreateUserHook(userToLink, {
+      skipPersonalOrganisation: !organisation.organisationAuthenticationPortal.allowPersonalOrganisations,
+    }).catch((err) => {
+      // Todo: (RR7) Add logging.
+      console.error(err);
+    });
+
+    const adminRuleEngine = new AdminRuleEngine({ requestMetadata: c.get('requestMetadata') });
+
+    await adminRuleEngine.run({
+      trigger: 'USER_SIGNED_UP',
+      user: userToLink,
+      signupMethod: UserAuthMethod.ORGANISATION_SSO,
+    });
+  }
+
+  await sendOrganisationAccountLinkConfirmationEmail({
+    type: userToLink.emailVerified ? 'link' : 'create',
+    userId: userToLink.id,
+    organisationId: organisation.id,
+    organisationName: organisation.name,
+    oauthConfig: {
+      accessToken,
+      idToken,
+      providerAccountId: sub,
+      expiresAt: Math.floor(accessTokenExpiresAt.getTime() / 1000),
+    },
+  });
+
+  return c.redirect(`${formatOrganisationLoginUrl(orgUrl)}?action=verification-required`, 302);
+};
