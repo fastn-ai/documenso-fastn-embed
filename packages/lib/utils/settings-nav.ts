@@ -9,6 +9,7 @@ import {
   GroupIcon,
   LockIcon,
   MailboxIcon,
+  PlugIcon,
   Settings2Icon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -256,6 +257,12 @@ export const getSettingsNavGroups = ({
               path: `/t/${team.url}/settings/webhooks`,
               label: msg`Webhooks`,
               icon: WebhookIcon,
+            },
+            {
+              key: 'integrations',
+              path: `/t/${team.url}/settings/integrations`,
+              label: msg`Integrations`,
+              icon: PlugIcon,
             },
           ],
         }
